@@ -1,0 +1,6 @@
+[server]
+enableStaticServing = true
+
+[client]
+showSidebarNavigation = false
+toolbarMode = "viewer"

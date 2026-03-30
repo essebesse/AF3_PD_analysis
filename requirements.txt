@@ -1,0 +1,8 @@
+# AF3 Pulldown Analysis Web App Dependencies
+streamlit>=1.30
+pandas
+numpy
+matplotlib
+gemmi
+openpyxl
+requests
