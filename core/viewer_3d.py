@@ -200,6 +200,9 @@ def generate_viewer_html(
     for i, cid in enumerate(all_chains):
         c = CHAIN_COLORS[i % len(CHAIN_COLORS)]
         label = chain_names[i] if chain_names and i < len(chain_names) else f'Chain {cid}'
+        # Escape HTML to prevent XSS from chain/gene names
+        import html as _html
+        label = _html.escape(label)
         chain_legend_items += (
             f'<div style="display:flex;align-items:center;gap:6px;margin:2px 0;">'
             f'<div style="width:14px;height:14px;border-radius:3px;border:1px solid #aaa;'

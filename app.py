@@ -37,7 +37,6 @@ st.markdown("### Web-based analysis for AlphaFold 3 protein interaction predicti
 # Check if core modules exist
 try:
     from core.scanner import AF3Scanner
-    from core.utils import format_score, calculate_confidence_tier, tier_color
 except ImportError as e:
     st.error(f"Failed to import core modules: {e}")
     st.stop()

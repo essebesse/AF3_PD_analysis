@@ -191,8 +191,11 @@ def show_detailed(project_path: str, af3_folder: str):
             if st.session_state.get('_detail_model_key') != model_key:
                 # Model changed — clear old cached plots/data
                 old_key = st.session_state.get('_detail_model_key', '')
+                old_pred = old_key.rsplit('_', 2)[0] if old_key else ''
                 for k in list(st.session_state.keys()):
-                    if k.startswith(('_pae_plot_', '_zoom_plot_', '_iface_', '_comp_plot_')) and old_key and old_key in k:
+                    if old_key and k.startswith(('_pae_plot_', '_zoom_plot_', '_iface_')) and old_key in k:
+                        del st.session_state[k]
+                    elif old_pred and k.startswith('_comp_plot_') and old_pred in k:
                         del st.session_state[k]
 
                 # Recompute all derived data
@@ -496,7 +499,7 @@ def show_detailed(project_path: str, af3_folder: str):
                     pae_matrices = []
                     model_labels = []
                     for ss in seed_samples:
-                        is_top = ss['ranking_score'] == selected_pred['ranking_score']
+                        is_top = ss['seed'] == selected_pred.get('seed') and ss['sample'] == selected_pred.get('sample')
                         label = "Top" if is_top else f"s{ss['seed']}-m{ss['sample']}"
                         conf = load_confidences(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
                         if conf and conf.get('pae'):

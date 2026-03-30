@@ -69,7 +69,7 @@ def parse_prediction_name(name: str) -> tuple:
         Tuple of (bait, prey) strings
     """
     if "_and_" in name:
-        parts = name.split("_and_")
+        parts = name.split("_and_", 1)
         return parts[0], parts[1]
     return name, ""
 
@@ -103,6 +103,8 @@ def fetch_gene_names_batch(accessions: list, progress_callback=None) -> dict:
     done = 0
     batch_size = 100
 
+    import time
+
     for i in range(0, total, batch_size):
         batch = accessions[i:i + batch_size]
         query = " OR ".join(f"accession:{acc}" for acc in batch)
@@ -122,12 +124,29 @@ def fetch_gene_names_batch(accessions: list, progress_callback=None) -> dict:
                         gene = parts[1].strip().split()[0] if parts[1].strip() else ''
                         if acc and gene:
                             result[acc] = gene
-        except Exception:
+            elif response.status_code == 429:
+                # Rate limited — wait and retry once
+                time.sleep(2)
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    lines = response.text.strip().split('\n')
+                    for line in lines[1:]:
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
+                            acc = parts[0].strip().upper()
+                            gene = parts[1].strip().split()[0] if parts[1].strip() else ''
+                            if acc and gene:
+                                result[acc] = gene
+        except requests.RequestException:
             pass
 
         done += len(batch)
         if progress_callback:
             progress_callback(done, total)
+
+        # Rate limit: ~1 request/second to respect UniProt API limits
+        if i + batch_size < total:
+            time.sleep(1.0)
 
     # Fill in accessions not returned by API (e.g. obsolete IDs) with empty string
     # so display code can distinguish "no gene name found" from "has gene name"

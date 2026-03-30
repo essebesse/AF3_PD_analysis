@@ -120,7 +120,9 @@ def show_results(project_path: str, af3_folder: str):
 
     # Resolve gene names FIRST so we can use them everywhere
     import pandas as pd
-    gene_cache = st.session_state.get('gene_name_cache', {})
+    if 'gene_name_cache' not in st.session_state:
+        st.session_state['gene_name_cache'] = {}
+    gene_cache = st.session_state['gene_name_cache']
 
     unique_accs = set()
     for r in filtered_results:
@@ -133,9 +135,11 @@ def show_results(project_path: str, af3_folder: str):
     missing_accs = [acc for acc in unique_accs if acc not in gene_cache]
     if missing_accs:
         from core.utils import fetch_gene_names_batch
-        new_genes = fetch_gene_names_batch(missing_accs)
-        st.session_state.setdefault('gene_name_cache', {}).update(new_genes)
-        gene_cache.update(new_genes)
+        try:
+            new_genes = fetch_gene_names_batch(missing_accs)
+            gene_cache.update(new_genes)
+        except Exception:
+            st.warning("Could not fetch gene names from UniProt.")
 
     def _pred_label(pred_name):
         """Turn 'q9bw83_and_q9ujt0' into 'IFT27 × TUBE1 (Q9BW83 × Q9UJT0)'."""
@@ -165,7 +169,7 @@ def show_results(project_path: str, af3_folder: str):
         "contacts_pae5": "contacts_pae5"
     }
     sort_key = sort_column_map.get(sort_by, "iptm")
-    filtered_results.sort(key=lambda r: r.get(sort_key) or 0, reverse=True)
+    filtered_results = sorted(filtered_results, key=lambda r: r.get(sort_key) or 0, reverse=True)
 
     display_data = []
     # Keep mapping from display row index to prediction name

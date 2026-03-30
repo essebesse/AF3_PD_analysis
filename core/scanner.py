@@ -258,8 +258,9 @@ class AF3Scanner:
 
 
 def scan_af3_directory(predictions_folder: str) -> Tuple[List[Dict], Dict]:
-    """Convenience function to scan a predictions directory."""
+    """Convenience function to scan a predictions directory and load summary data."""
     scanner = AF3Scanner(Path(predictions_folder))
-    predictions = scanner.scan()
+    scanner.scan()
+    predictions = scanner.load_all()
     stats = scanner.get_summary_stats()
     return predictions, stats

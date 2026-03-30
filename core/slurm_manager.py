@@ -32,7 +32,8 @@ def submit_job(script_content: str, working_dir: str) -> Dict:
             ['sbatch', temp_script],
             capture_output=True,
             text=True,
-            cwd=working_dir
+            cwd=working_dir,
+            timeout=60
         )
 
         # Clean up temp file
@@ -63,7 +64,8 @@ def check_job_status(job_id: str) -> Dict:
         result = subprocess.run(
             ['squeue', '-j', job_id, '--noheader', '-o', '%T'],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=30
         )
 
         status = result.stdout.strip()
@@ -72,15 +74,25 @@ def check_job_status(job_id: str) -> Dict:
             return {'status': 'RUNNING', 'running': True, 'completed': False}
         elif status == 'PENDING':
             return {'status': 'PENDING', 'running': False, 'completed': False}
-        elif status == 'COMPLETED':
-            return {'status': 'COMPLETED', 'running': False, 'completed': True}
-        elif status == 'FAILED':
-            return {'status': 'FAILED', 'running': False, 'completed': True}
+        elif status in ('FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL'):
+            return {'status': status, 'running': False, 'completed': True}
         elif not status:
-            # Job not found - may have completed already
-            return {'status': 'UNKNOWN', 'running': False, 'completed': True}
+            # Job no longer in queue — likely completed, failed, or cancelled.
+            # Use sacct for definitive status if available.
+            try:
+                sacct = subprocess.run(
+                    ['sacct', '-j', job_id, '--noheader', '-o', 'State', '-P'],
+                    capture_output=True, text=True, timeout=15
+                )
+                sacct_status = sacct.stdout.strip().split('\n')[0].strip() if sacct.stdout.strip() else ''
+                if sacct_status:
+                    done = sacct_status not in ('RUNNING', 'PENDING')
+                    return {'status': sacct_status, 'running': not done, 'completed': done}
+            except Exception:
+                pass
+            return {'status': 'COMPLETED', 'running': False, 'completed': True}
         else:
-            return {'status': status, 'running': status in ['RUNNING', 'PENDING'], 'completed': False}
+            return {'status': status, 'running': status in ['RUNNING', 'PENDING', 'CONFIGURING'], 'completed': False}
 
     except Exception as e:
         return {'status': 'ERROR', 'running': False, 'completed': False, 'error': str(e)}
@@ -125,7 +137,8 @@ def cancel_job(job_id: str) -> Dict:
         result = subprocess.run(
             ['scancel', job_id],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=30
         )
 
         if result.returncode == 0:

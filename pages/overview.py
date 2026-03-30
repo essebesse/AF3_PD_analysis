@@ -85,7 +85,9 @@ def show_load_data(project_path: str, af3_folder: str):
         tab_preview, tab_full = st.tabs(["📋 Top Predictions", "🔬 All Models"])
 
         with tab_preview:
-            gene_cache = st.session_state.get('gene_name_cache', {})
+            if 'gene_name_cache' not in st.session_state:
+                st.session_state['gene_name_cache'] = {}
+            gene_cache = st.session_state['gene_name_cache']
             top_20 = sorted(per_pred, key=lambda x: x.get('iptm', 0), reverse=True)[:20]
 
             display_data = []
@@ -117,7 +119,9 @@ def show_load_data(project_path: str, af3_folder: str):
                 v = r.get(key)
                 return int(v) if v is not None else "-"
 
-            gene_cache = st.session_state.get('gene_name_cache', {})
+            if 'gene_name_cache' not in st.session_state:
+                st.session_state['gene_name_cache'] = {}
+            gene_cache = st.session_state['gene_name_cache']
 
             unique_accs = set()
             for r in cached:
@@ -131,9 +135,11 @@ def show_load_data(project_path: str, af3_folder: str):
             if missing_accs:
                 st.info(f"Fetching gene names for {len(missing_accs)} proteins...")
                 from core.utils import fetch_gene_names_batch
-                new_genes = fetch_gene_names_batch(missing_accs)
-                st.session_state.setdefault('gene_name_cache', {}).update(new_genes)
-                gene_cache.update(new_genes)
+                try:
+                    new_genes = fetch_gene_names_batch(missing_accs)
+                    gene_cache.update(new_genes)
+                except Exception:
+                    st.warning("Could not fetch gene names from UniProt.")
 
             rows = []
             for r in cached:

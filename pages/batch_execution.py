@@ -252,7 +252,7 @@ def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cu
 
                     with status_container:
                         st.info(f"Completed: {pred_label}")
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError, EOFError, OSError):
             # Worker pipe broke (e.g. Streamlit rerun) — use whatever results came in
             st.warning(f"Pool interrupted — saving {len(all_results)} models collected so far.")
 
@@ -278,8 +278,8 @@ def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cu
                 try:
                     with open(pred_json, 'w') as pf:
                         json.dump(entries, pf, indent=2)
-                except Exception:
-                    pass
+                except OSError as e:
+                    st.warning(f"Could not save {pred_json.name}: {e}")
 
         # Save combined results (big JSON)
         cache_file = Path(af3_folder) / "af3_app_all_models_analysis.json"
@@ -465,7 +465,7 @@ def submit_slurm_jobs(af3_folder: str, num_jobs: int, cpus_per_job: int,
         output_file = af3_path / f"_slurm_results_{i}.json"
         job_name = f"AF3app_{Path(af3_folder).name}_chunk{i}"
 
-        # Escape paths for safe embedding in shell and Python string literals
+        # Escape paths for safe embedding in shell single-quoted strings
         esc_chunk = str(chunk_file).replace("'", "'\\''")
         esc_af3 = str(af3_folder).replace("'", "'\\''")
         esc_output = str(output_file).replace("'", "'\\''")
@@ -481,8 +481,8 @@ def submit_slurm_jobs(af3_folder: str, num_jobs: int, cpus_per_job: int,
 #SBATCH --time=23:59:59
 #SBATCH --qos={qos}
 #SBATCH --partition={partition}
-#SBATCH --output="{af3_folder}/AF3_app_chunk{i}_%j.log"
-#SBATCH --error="{af3_folder}/AF3_app_chunk{i}_%j.err"
+#SBATCH --output='{esc_af3}/AF3_app_chunk{i}_%j.log'
+#SBATCH --error='{esc_af3}/AF3_app_chunk{i}_%j.err'
 
 echo "AF3 Analysis App - Chunk {i+1}/{len(chunks)}"
 echo "Job ID: $SLURM_JOB_ID | Node: $SLURMD_NODENAME | CPUs: $SLURM_CPUS_PER_TASK"
@@ -492,16 +492,21 @@ echo "Start: $(date)"
 source '{esc_venv}'
 cd '{esc_app}'
 
-python -c '
-import json, sys
+# Pass paths via environment variables to avoid shell/Python quoting issues
+export AF3_CHUNK_FILE='{esc_chunk}'
+export AF3_FOLDER='{esc_af3}'
+export AF3_OUTPUT_FILE='{esc_output}'
+
+python << 'PYEOF'
+import json, sys, os
 from pathlib import Path
 from multiprocessing import Pool
 from functools import partial
 from core.analyzer import analyze_prediction_all_models
 
-chunk_file = "{esc_chunk}"
-af3_folder = "{esc_af3}"
-output_file = "{esc_output}"
+chunk_file = os.environ["AF3_CHUNK_FILE"]
+af3_folder = os.environ["AF3_FOLDER"]
+output_file = os.environ["AF3_OUTPUT_FILE"]
 
 with open(chunk_file) as f:
     pred_paths = [line.strip() for line in f if line.strip()]
@@ -520,10 +525,8 @@ with Pool({cpus_per_job}) as pool:
             for r in result_list:
                 r.pop("sequences", None)
             all_results.extend(result_list)
-            # Save per-prediction JSON in the prediction dir
             pn = result_list[0].get("prediction_name", "")
             if pn:
-                # Find matching resolved dir by name
                 pdir = next((d for d in pred_dirs if d.name == pn), None)
                 if pdir:
                     try:
@@ -538,7 +541,7 @@ with open(output_file, "w") as f:
     json.dump(all_results, f)
 
 print(f"Done: {{len(all_results)}} models saved to {{output_file}}")
-'
+PYEOF
 
 echo "Finished: $(date)"
 """

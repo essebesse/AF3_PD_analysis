@@ -19,23 +19,28 @@ AROMATIC_RESIDUES = {'F', 'Y', 'W', 'H'}
 POLAR_ATOMS = {'N', 'O', 'S'}
 
 
-def classify_interaction(res_name_a: str, atom_name_a: str,
-                         res_name_b: str, atom_name_b: str,
+def classify_interaction(res_name_a: str, res_name_b: str,
                          distance: float) -> str:
     """
-    Classify chemical interaction type between two residues.
+    Classify chemical interaction type between two residues based on
+    residue identity and CB-CB distance.
+
+    Note: Since we only have CB/CA representative distances (not actual
+    closest-atom distances), the distance thresholds are adjusted for
+    CB-CB geometry. This is an approximation.
 
     Args:
         res_name_a: Three-letter amino acid code for residue A
-        atom_name_a: Atom name for residue A
         res_name_b: Three-letter amino acid code for residue B
-        atom_name_b: Atom name for residue B
-        distance: Distance between atoms in Angstrom
+        distance: CB-CB distance in Angstrom
 
     Returns:
         One of: 'hydrophobic', 'hydrogen_bond', 'salt_bridge',
                 'aromatic', 'polar', 'other'
     """
+    # Residues whose sidechains can donate/accept H-bonds
+    HBOND_RESIDUES = {'S', 'T', 'N', 'Q', 'Y', 'C', 'D', 'E', 'R', 'K', 'H', 'W'}
+
     # Convert to one-letter codes
     three_to_one = {
         'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
@@ -47,16 +52,15 @@ def classify_interaction(res_name_a: str, atom_name_a: str,
     aa_a = three_to_one.get(res_name_a.upper(), 'X')
     aa_b = three_to_one.get(res_name_b.upper(), 'X')
 
-    # Salt bridge: charged pairs (R/K/H with D/E) and dist < 4.0
-    if aa_a in CHARGED_POSITIVE and aa_b in CHARGED_NEGATIVE and distance < 4.0:
+    # Salt bridge: charged pairs (R/K/H with D/E) and dist < 5.5 (CB-CB)
+    if aa_a in CHARGED_POSITIVE and aa_b in CHARGED_NEGATIVE and distance < 5.5:
         return 'salt_bridge'
-    if aa_a in CHARGED_NEGATIVE and aa_b in CHARGED_POSITIVE and distance < 4.0:
+    if aa_a in CHARGED_NEGATIVE and aa_b in CHARGED_POSITIVE and distance < 5.5:
         return 'salt_bridge'
 
-    # Hydrogen bond: polar atoms (N, O, S) and dist < 3.5
-    if atom_name_a[0] in POLAR_ATOMS or atom_name_b[0] in POLAR_ATOMS:
-        if distance < 3.5:
-            return 'hydrogen_bond'
+    # Hydrogen bond: at least one residue has H-bond capable sidechain, dist < 5.0 (CB-CB)
+    if (aa_a in HBOND_RESIDUES or aa_b in HBOND_RESIDUES) and distance < 5.0:
+        return 'hydrogen_bond'
 
     # Aromatic: aromatic residues (F, Y, W, H) both sides and dist < 5.5
     if aa_a in AROMATIC_RESIDUES and aa_b in AROMATIC_RESIDUES and distance < 5.5:
@@ -66,8 +70,8 @@ def classify_interaction(res_name_a: str, atom_name_a: str,
     if aa_a in HYDROPHOBIC_RESIDUES and aa_b in HYDROPHOBIC_RESIDUES and distance < 5.0:
         return 'hydrophobic'
 
-    # Polar: everything else with dist < 4.0
-    if distance < 4.0:
+    # Polar: everything else with dist < 5.0
+    if distance < 5.0:
         return 'polar'
 
     return 'other'
@@ -205,12 +209,7 @@ def analyze_interface(cif_path: Path,
             res_name_a = res_names.get((chain_a_id, res_a), 'UNK')
             res_name_b = res_names.get((chain_b_id, res_b), 'UNK')
 
-            # Use representative atom names (CB or CA) for interaction type
-            atom_name_a = 'CB' if cb_is_cb.get((chain_a_id, res_a), False) else 'CA'
-            atom_name_b = 'CB' if cb_is_cb.get((chain_b_id, res_b), False) else 'CA'
-
-            interaction_type = classify_interaction(res_name_a, atom_name_a,
-                                                    res_name_b, atom_name_b, dist)
+            interaction_type = classify_interaction(res_name_a, res_name_b, dist)
 
             contacts.append({
                 'chain_a_res': res_a,

@@ -9,6 +9,12 @@ import sys
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 
+# Ensure the project root is on sys.path so 'core.*' imports work
+# regardless of working directory (e.g., when spawned by SLURM)
+_project_root = str(Path(__file__).resolve().parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 
 def find_prediction_dirs(af3_folder: Path) -> list:
     """Find all prediction directories (skip seed-* and hidden dirs)."""

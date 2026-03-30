@@ -164,8 +164,9 @@ cmd.color("lightorange", f"chain {{CHAIN_B}}")
         script += f'cmd.select("{sel_name}", f"chain {chain_id} and resi {sel}")\n'
         script += f'cmd.color("{color}", "{sel_name}")  # {desc}\n'
 
-    # Show interface as sticks
-    script += '''
+    # Show interface as sticks (only if interface residues exist)
+    if interface_a or interface_b:
+        script += '''
 # ── Show interface residues as sticks ──────────────────────────────────
 cmd.show("sticks", "interface_all")
 cmd.set("stick_radius", 0.15, "interface_all")
@@ -186,12 +187,23 @@ cmd.set("stick_radius", 0.15, "interface_all")
             script += f'cmd.set("sphere_scale", 0.6, f"hubs_{protein_b_name}")\n'
 
     # Convenience functions
+    has_interface = bool(interface_a or interface_b)
+    has_hubs_a = bool(hub_a_residues)
+    has_hubs_b = bool(hub_b_residues)
+
     script += f'''
 # ── Convenience functions ──────────────────────────────────────────────
+_has_interface = {has_interface}
+_has_hubs_a = {has_hubs_a}
+_has_hubs_b = {has_hubs_b}
+
 def show_interface():
     """Zoom to interface region"""
-    cmd.zoom("interface_all", buffer=10)
-    print("Zoomed to interface")
+    if _has_interface:
+        cmd.zoom("interface_all", buffer=10)
+        print("Zoomed to interface")
+    else:
+        print("No interface residues found")
 
 def show_chain_a():
     """Focus on {protein_a_name}"""
@@ -206,14 +218,19 @@ def show_pae_only():
     cmd.hide("sticks")
     cmd.hide("spheres")
     cmd.show("cartoon")
-    cmd.zoom("interface_all", buffer=10)
+    if _has_interface:
+        cmd.zoom("interface_all", buffer=10)
 
 def show_contacts():
     """Show interface sticks and hub spheres"""
-    cmd.show("sticks", "interface_all")
-    cmd.show("spheres", "hubs_{protein_a_name} and name CA")
-    cmd.show("spheres", "hubs_{protein_b_name} and name CA")
-    cmd.zoom("interface_all", buffer=10)
+    if _has_interface:
+        cmd.show("sticks", "interface_all")
+    if _has_hubs_a:
+        cmd.show("spheres", "hubs_{protein_a_name} and name CA")
+    if _has_hubs_b:
+        cmd.show("spheres", "hubs_{protein_b_name} and name CA")
+    if _has_interface:
+        cmd.zoom("interface_all", buffer=10)
 
 cmd.extend("show_interface", show_interface)
 cmd.extend("show_chain_a", show_chain_a)
@@ -223,7 +240,8 @@ cmd.extend("show_contacts", show_contacts)
 
 # ── Final setup ────────────────────────────────────────────────────────
 cmd.deselect()
-cmd.zoom("interface_all", buffer=12)
+if _has_interface:
+    cmd.zoom("interface_all", buffer=12)
 cmd.set("ray_shadow", 0)
 cmd.set("specular", 0.2)
 
