@@ -530,21 +530,24 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
     """
     Analyze models in a prediction directory.
 
+    Supports both local AF3 pipeline format (seed-N_sample-M subdirs +
+    ranking_scores.csv) and AF3 Server flat format (fold_*_model_N.cif +
+    fold_*_full_data_N.json files directly in the folder).
+
     Args:
-        top_only: If True, only analyze the top-ranked model (first row in ranking_scores.csv).
+        top_only: If True, only analyze the top-ranked model.
     Returns list of analysis results, one per model.
     """
-    results = []
-
-    # Resolve AF3 Server extra nesting (name/name/)
-    from core.scanner import resolve_prediction_dir
+    from core.scanner import resolve_prediction_dir, _is_af3_server_flat
     pred_dir = resolve_prediction_dir(pred_dir)
 
-    # Get prediction prefix from directory name
+    if _is_af3_server_flat(pred_dir):
+        return _analyze_server_flat(pred_dir, ipsae_pae_cutoff, top_only)
+
+    results = []
     pred_name = pred_dir.name
     prefix = pred_name
 
-    # Load ranking_scores.csv to get all seed/sample combinations
     ranking_file = pred_dir / f"{pred_name}_ranking_scores.csv"
     if not ranking_file.exists():
         ranking_file = pred_dir / "ranking_scores.csv"
@@ -552,8 +555,6 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
         return []
 
     df = pd.read_csv(ranking_file)
-
-    # Get top-ranked model info
     top_ranked = df.iloc[0] if len(df) > 0 else None
 
     rows = df.iloc[:1] if top_only else df
@@ -563,7 +564,6 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
 
         result = analyze_sample(pred_dir, prefix, seed, sample, ipsae_pae_cutoff)
         if result:
-            # Mark if this is the top-ranked model
             is_top = (top_ranked is not None and
                      int(top_ranked['seed']) == seed and
                      int(top_ranked['sample']) == sample)
@@ -572,3 +572,181 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
             results.append(result)
 
     return results
+
+
+def _analyze_server_flat(pred_dir: Path, ipsae_pae_cutoff: float = 10.0,
+                          top_only: bool = False) -> List[Dict]:
+    """
+    Analyze an AF3 Server flat-format prediction folder.
+
+    Files are named fold_<name>_model_N.cif, fold_<name>_full_data_N.json,
+    fold_<name>_summary_confidences_N.json where N = 0..4.
+    full_data_N.json contains the PAE matrix (same structure as confidences.json).
+    """
+    import re as _re
+
+    pred_name = pred_dir.name
+    # Infer prefix from summary files
+    summary_files = sorted(pred_dir.glob('*_summary_confidences_*.json'))
+    if not summary_files:
+        return []
+    prefix_match = _re.match(r'^(.+)_summary_confidences_\d+\.json$', summary_files[0].name)
+    if not prefix_match:
+        return []
+    prefix = prefix_match.group(1)
+
+    # Collect model indices from available model files
+    model_indices = sorted(
+        int(m.group(1))
+        for f in pred_dir.glob(f'{prefix}_model_*.cif')
+        if (m := _re.search(r'_model_(\d+)\.cif$', f.name))
+    )
+    if not model_indices:
+        return []
+
+    # Determine top-ranked by ranking_score
+    scores = {}
+    for idx in model_indices:
+        sf = pred_dir / f"{prefix}_summary_confidences_{idx}.json"
+        if sf.exists():
+            with open(sf) as f:
+                s = json.load(f)
+            scores[idx] = float(s.get('ranking_score', 0))
+    top_idx = max(scores, key=scores.get) if scores else model_indices[0]
+
+    indices_to_run = [top_idx] if top_only else model_indices
+
+    results = []
+    for idx in indices_to_run:
+        result = _analyze_server_model(pred_dir, prefix, idx, ipsae_pae_cutoff)
+        if result:
+            result['is_top_ranked'] = (idx == top_idx)
+            result['prediction_name'] = pred_name
+            results.append(result)
+
+    return results
+
+
+def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
+                           ipsae_pae_cutoff: float = 10.0) -> Optional[Dict]:
+    """
+    Analyze a single model from an AF3 Server flat-format folder.
+    """
+    try:
+        # Load summary
+        summary_file = pred_dir / f"{prefix}_summary_confidences_{model_idx}.json"
+        if not summary_file.exists():
+            return None
+        with open(summary_file) as f:
+            summary = json.load(f)
+
+        # Load full_data (contains PAE, atom_plddts, token_chain_ids, etc.)
+        full_data_file = pred_dir / f"{prefix}_full_data_{model_idx}.json"
+        if not full_data_file.exists():
+            return None
+        with open(full_data_file) as f:
+            confidences = json.load(f)
+
+        pae_matrix = np.array(confidences.get('pae', []))
+        if pae_matrix.size == 0:
+            return None
+
+        _, chain_a_indices, chain_b_indices, _ = extract_chain_indices(confidences)
+        if not chain_a_indices or not chain_b_indices:
+            return None
+
+        ipsae = calculate_ipsae(pae_matrix, chain_a_indices, chain_b_indices, ipsae_pae_cutoff)
+
+        # CIF file for spatial contact calculation
+        cif_path = pred_dir / f"{prefix}_model_{model_idx}.cif"
+
+        contacts_pae3 = contacts_pae5 = contacts_pae8 = 0
+        interface_residue_indices: Set[int] = set()
+
+        if cif_path.exists():
+            parser = CIFParser(str(cif_path))
+            if parser.parse_atoms():
+                chain_ids = parser.get_chain_ids()
+                if len(chain_ids) >= 2:
+                    chain_a_id, chain_b_id = chain_ids[0], chain_ids[1]
+                    chain_a_res = parser.get_chain_residues(chain_a_id)
+                    chain_b_res = parser.get_chain_residues(chain_b_id)
+
+                    cb_coords: Dict[tuple, tuple] = {}
+                    for atom in parser.atoms:
+                        key = (atom['chain_id'], atom['seq_id'])
+                        name = atom['atom_name']
+                        if name == 'CB' or (name == 'CA' and key not in cb_coords):
+                            cb_coords[key] = (atom['x'], atom['y'], atom['z'])
+
+                    for i, res_a in enumerate(chain_a_res):
+                        a_idx = chain_a_indices[i] if i < len(chain_a_indices) else -1
+                        if a_idx < 0:
+                            continue
+                        coord_a = cb_coords.get((chain_a_id, res_a))
+                        if coord_a is None:
+                            continue
+                        for j, res_b in enumerate(chain_b_res):
+                            b_idx = chain_b_indices[j] if j < len(chain_b_indices) else -1
+                            if b_idx < 0 or a_idx >= len(pae_matrix) or b_idx >= pae_matrix.shape[1]:
+                                continue
+                            pae_val = pae_matrix[a_idx, b_idx]
+                            if pae_val > 8.0:
+                                continue
+                            coord_b = cb_coords.get((chain_b_id, res_b))
+                            if coord_b is None:
+                                continue
+                            dx = coord_a[0] - coord_b[0]
+                            dy = coord_a[1] - coord_b[1]
+                            dz = coord_a[2] - coord_b[2]
+                            dist = (dx*dx + dy*dy + dz*dz) ** 0.5
+                            if dist > 8.0:
+                                continue
+                            if pae_val <= 3:
+                                contacts_pae3 += 1
+                            if pae_val <= 5:
+                                contacts_pae5 += 1
+                            contacts_pae8 += 1
+                            if pae_val <= 6.0:
+                                interface_residue_indices.add(a_idx)
+                                interface_residue_indices.add(b_idx)
+
+        # Interface pLDDT
+        atom_plddts = confidences.get('atom_plddts', [])
+        interface_plddt = 0.0
+        if atom_plddts and interface_residue_indices and cif_path.exists():
+            token_chain_ids = confidences.get('token_chain_ids', [])
+            token_res_ids = confidences.get('token_res_ids', [])
+            interface_residues = set()
+            for idx in interface_residue_indices:
+                if idx < len(token_chain_ids) and idx < len(token_res_ids):
+                    interface_residues.add((token_chain_ids[idx], token_res_ids[idx]))
+            interface_plddt_values = []
+            for atom_idx, atom in enumerate(parser.atoms):
+                if atom_idx >= len(atom_plddts):
+                    break
+                if (atom['chain_id'], atom['seq_id']) in interface_residues:
+                    interface_plddt_values.append(float(atom_plddts[atom_idx]))
+            if interface_plddt_values:
+                interface_plddt = float(np.mean(interface_plddt_values))
+
+        return {
+            'seed': 0,
+            'sample': model_idx,
+            'iptm': float(summary.get('iptm', 0)),
+            'ptm': float(summary.get('ptm', 0)),
+            'ranking_score': float(summary.get('ranking_score', 0)),
+            'ipsae': round(ipsae, 4),
+            'interface_plddt': round(float(interface_plddt), 2),
+            'contacts_pae3': contacts_pae3,
+            'contacts_pae5': contacts_pae5,
+            'contacts_pae8': contacts_pae8,
+            'fraction_disordered': float(summary.get('fraction_disordered', 0)),
+            'pae_mean': float(np.mean(pae_matrix)) if pae_matrix.size > 0 else 0,
+            'cif_path': str(cif_path) if cif_path.exists() else None,
+            'format': 'server_flat',
+        }
+
+    except Exception as e:
+        print(f"Error analyzing server model {model_idx}: {e}")
+        return None

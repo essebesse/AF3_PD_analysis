@@ -10,11 +10,23 @@ A Streamlit-based GUI for analyzing AlphaFold 3 pulldown (AF3-PD) prediction dat
 - **Detailed Analysis**: PAE matrices, interface contacts, hub residues
 - **Batch Execution**: Local multiprocessing or SLURM cluster submission
 - **Export**: Download results as CSV or XLSX
+- **AF3 Server support**: Analyze predictions downloaded directly from the AlphaFold Server
 
-## Installation
+## Local Setup / Installation
+
+It is recommended to use a Python virtual environment to avoid polluting your global packages.
 
 ```bash
-cd /path/to/SCRIPTS/af3_analysis_app/
+# Clone or copy the repository
+cd /path/to/af3_analysis_app/
+
+# Create a virtual environment (Python 3.11 recommended)
+python3 -m venv venv
+
+# Activate the virtual environment
+source venv/bin/activate   # Linux / macOS
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
@@ -30,49 +42,77 @@ pip install -r requirements.txt
 
 ## Usage
 
+With the virtual environment active, launch the app with the provided script:
+
 ```bash
-cd /path/to/SCRIPTS/af3_analysis_app/
+bash run.sh
+```
+
+Or manually:
+
+```bash
+source venv/bin/activate
 streamlit run app.py
 ```
 
 Then open your browser to `http://localhost:8501`
 
-## Project Structure
-
-```
-SCRIPTS/af3_analysis_app/
-├── app.py                          # Main Streamlit entry point
-├── pages/
-│   ├── 1_Overview.py               # Project selection + summary
-│   ├── 2_Results.py                # Sortable results table
-│   ├── 3_Detailed_Analysis.py      # Per-prediction deep dive
-│   └── 4_Batch_Execution.py        # Local/SLURM execution
-├── core/
-│   ├── __init__.py
-│   ├── scanner.py                  # AF3 directory scanning
-│   ├── analyzer.py                 # Core analysis logic
-│   └── utils.py                    # Shared utilities
-├── requirements.txt
-└── README.md
-```
-
 ## Expected Data Structure
 
-The app expects AF3 prediction directories in this format:
+### Local AF3 pipeline output
 
 ```
 ProjectFolder/
   AF3/
     <bait>_and_<target>/
-      <name>_model.cif
-      <name>_confidences.json
-      <name>_summary_confidences.json
-      <name>_data.json
       ranking_scores.csv
       seed-N_sample-M/
-        confidences.json
         model.cif
+        confidences.json
         summary_confidences.json
+```
+
+### AlphaFold Server output (flat format)
+
+Predictions downloaded from the AlphaFold Server can be loaded directly after
+unzipping. Point the app at the folder containing the flat files:
+
+```
+fold_<name>/
+  fold_<name>_model_0.cif
+  fold_<name>_model_1.cif
+  ...
+  fold_<name>_summary_confidences_0.json
+  fold_<name>_summary_confidences_1.json
+  ...
+  fold_<name>_full_data_0.json
+  fold_<name>_full_data_1.json
+  ...
+  fold_<name>_job_request.json
+```
+
+## Project Structure
+
+```
+af3_analysis_app/
+├── app.py                       # Main Streamlit entry point
+├── run.sh                       # Launcher script
+├── pages/
+│   ├── overview.py              # Step 1: Load Data
+│   ├── batch_execution.py       # Step 2: Analyze
+│   ├── results.py               # Step 3: Results table
+│   └── detailed_analysis.py     # Step 4: Detailed Analysis
+├── core/
+│   ├── scanner.py               # AF3 directory scanning (local + server format)
+│   ├── analyzer.py              # Core analysis logic (ipSAE, contacts, pLDDT)
+│   ├── interface_analyzer.py    # Contact classification and hub residues
+│   ├── pae_plotter.py           # PAE matrix visualization
+│   ├── viewer_3d.py             # 3Dmol.js 3D structure viewer
+│   ├── pymol_script.py          # PyMOL script generator
+│   ├── slurm_manager.py         # SLURM job submission
+│   └── utils.py                 # Shared utilities
+├── requirements.txt
+└── README.md
 ```
 
 ## Analysis Metrics
@@ -83,13 +123,6 @@ ProjectFolder/
 - **PAE contacts**: Number of residue pairs below PAE threshold
 - **Confidence tiers**: High (>0.7), Medium (0.5-0.7), Low (0.3-0.5)
 
-## Based On
-
-This app extracts and adapts core analysis functions from:
-- `AF3_PD_analysis_v4.py` - Main batch analysis with ipSAE
-- `AF3_complex_analysis_v4.py` - Multi-subunit analysis
-- `interface_analysis/` - Interface contact analysis
-
 ## License
 
-Same as the parent AF3_PD_analysis project.
+MIT License — see [LICENSE](LICENSE).

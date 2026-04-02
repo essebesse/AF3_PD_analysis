@@ -26,3 +26,12 @@ af3_app_all_models_analysis.json
 
 # Claude Code local config
 .claude/
+
+# Internal development notes (not for public repo)
+TODO_NEXT.md
+progress.md
+paper_text_webapp_methods.txt
+AF3_Analysis_App_User_Manual.txt
+
+# Alternative venv directory name
+venv/

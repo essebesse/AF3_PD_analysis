@@ -33,6 +33,31 @@ def resolve_prediction_dir(d: Path) -> Path:
     return d
 
 
+def _is_af3_server_flat(d: Path) -> bool:
+    """
+    Detect AF3 Server flat-file format.
+
+    The AlphaFold Server produces a folder with files named:
+      fold_<name>_model_N.cif
+      fold_<name>_summary_confidences_N.json
+      fold_<name>_full_data_N.json
+    directly inside the folder (no seed subdirectories).
+    """
+    try:
+        files = list(d.iterdir())
+        has_model = any(
+            f.is_file() and re.search(r'_model_\d+\.cif$', f.name)
+            for f in files
+        )
+        has_summary = any(
+            f.is_file() and re.search(r'_summary_confidences_\d+\.json$', f.name)
+            for f in files
+        )
+        return has_model and has_summary
+    except PermissionError:
+        return False
+
+
 def _dir_has_predictions(d: Path) -> bool:
     """Check if a directory directly contains AF3 prediction subdirectories."""
     try:
@@ -40,6 +65,9 @@ def _dir_has_predictions(d: Path) -> bool:
             if not child.is_dir() or child.name.startswith('.'):
                 continue
             resolved = resolve_prediction_dir(child)
+            # AF3 Server flat format
+            if _is_af3_server_flat(resolved):
+                return True
             # Check for summary_confidences.json (with or without name prefix)
             if any(resolved.glob('*summary_confidences.json')):
                 return True
@@ -73,6 +101,16 @@ def find_af3_projects_recursive(root: str, max_depth: int = 6) -> List[Dict]:
             return
 
         for d in sorted(subdirs):
+            # Check if d is an AF3 Server flat prediction folder itself
+            if _is_af3_server_flat(d):
+                results.append({
+                    'project_path': str(d),
+                    'af3_folder': str(d),
+                    'label': str(d.relative_to(root_path)),
+                    'format': 'server_flat',
+                })
+                continue  # don't descend further
+
             # Check if d/AF3/ is a predictions folder
             af3_sub = d / "AF3"
             if af3_sub.is_dir() and _dir_has_predictions(af3_sub):
@@ -113,16 +151,108 @@ def find_predictions_folder(project_path: str) -> Optional[str]:
     return None
 
 
+def _load_server_flat_prediction(pred_dir: Path) -> Optional[Dict]:
+    """
+    Load summary data for an AF3 Server flat-format prediction folder.
+
+    Reads all fold_<name>_summary_confidences_N.json files (N=0-4) and returns
+    the entry with the highest ranking_score as the representative summary, plus
+    a seed_samples list ordered by ranking_score descending.
+    """
+    try:
+        # Discover all summary files: fold_<name>_summary_confidences_N.json
+        summary_files = sorted(pred_dir.glob('*_summary_confidences_*.json'))
+        if not summary_files:
+            return None
+
+        # Infer prefix from first file: strip _summary_confidences_N.json
+        first = summary_files[0].name
+        prefix_match = re.match(r'^(.+)_summary_confidences_\d+\.json$', first)
+        if not prefix_match:
+            return None
+        prefix = prefix_match.group(1)
+
+        # Parse the prediction name — AF3 Server uses fold_<bait>_<target>
+        pred_name = pred_dir.name
+        # Try to split on last underscore-separated word after "fold_"
+        name_part = pred_name
+        if name_part.startswith('fold_'):
+            name_part = name_part[5:]  # strip "fold_"
+        # Try _and_ split first; fall back to using the full name
+        and_match = re.match(r'(.+)_and_(.+)', name_part)
+        if and_match:
+            bait_name = and_match.group(1)
+            prey_name = and_match.group(2)
+        else:
+            # No _and_ — store whole name as bait
+            bait_name = name_part
+            prey_name = ""
+
+        # Load all per-model summaries
+        seed_samples = []
+        for sf in sorted(summary_files):
+            idx_match = re.search(r'_summary_confidences_(\d+)\.json$', sf.name)
+            if not idx_match:
+                continue
+            model_idx = int(idx_match.group(1))
+            with open(sf, 'r') as f:
+                s = json.load(f)
+            seed_samples.append({
+                'seed': 0,
+                'sample': model_idx,
+                'ranking_score': float(s.get('ranking_score', 0)),
+                'iptm': float(s.get('iptm', 0)),
+                'ptm': float(s.get('ptm', 0)),
+            })
+
+        if not seed_samples:
+            return None
+
+        # Sort by ranking_score descending; top-ranked model is representative
+        seed_samples.sort(key=lambda x: x['ranking_score'], reverse=True)
+        top = seed_samples[0]
+
+        # Load the top-ranked summary file for detailed fields
+        top_summary_file = pred_dir / f"{prefix}_summary_confidences_{top['sample']}.json"
+        with open(top_summary_file, 'r') as f:
+            top_summary = json.load(f)
+
+        return {
+            'name': pred_name,
+            'bait': bait_name,
+            'prey': prey_name,
+            'iptm': float(top_summary.get('iptm', 0)),
+            'ptm': float(top_summary.get('ptm', 0)),
+            'ranking_score': float(top_summary.get('ranking_score', 0)),
+            'fraction_disordered': float(top_summary.get('fraction_disordered', 0)),
+            'has_clash': float(top_summary.get('has_clash', 0)),
+            'chain_iptm': top_summary.get('chain_iptm', []),
+            'chain_pair_iptm': top_summary.get('chain_pair_iptm', []),
+            'chain_ptm': top_summary.get('chain_ptm', []),
+            'seed_samples': seed_samples,
+            'prediction_dir': str(pred_dir),
+            'format': 'server_flat',
+            'server_prefix': prefix,
+        }
+    except Exception as e:
+        print(f"Error loading server flat prediction {pred_dir}: {e}")
+        return None
+
+
 def load_prediction_data(pred_dir: Path) -> Optional[Dict]:
     """
     Load summary data for a single prediction directory.
     Reads only summary_confidences.json (~330B) and ranking_scores.csv (~150B).
-    Handles AF3 Server nesting (name/name/) automatically.
+    Handles AF3 Server nesting (name/name/) and flat server format automatically.
     """
     try:
         # Resolve AF3 Server extra nesting
         pred_dir = resolve_prediction_dir(pred_dir)
         pred_name = pred_dir.name
+
+        # --- AF3 Server flat format ---
+        if _is_af3_server_flat(pred_dir):
+            return _load_server_flat_prediction(pred_dir)
 
         # Find summary_confidences.json
         summary_file = pred_dir / f"{pred_name}_summary_confidences.json"
@@ -185,19 +315,58 @@ class AF3Scanner:
 
     def scan(self) -> List[Dict]:
         """
-        Fast scan: just lists subdirectories. No file I/O.
+        Fast scan: lists subdirectories (and detects AF3 Server flat format).
         Returns list of dicts with name, bait, prey, prediction_dir.
         """
         if not self.af3_folder.exists():
             raise ValueError(f"Predictions folder not found: {self.af3_folder}")
 
         self.predictions = []
+
+        # If the folder itself is an AF3 Server flat prediction (user pointed
+        # directly at the unzipped server folder), treat it as one prediction.
+        if _is_af3_server_flat(self.af3_folder):
+            pred_name = self.af3_folder.name
+            name_part = pred_name[5:] if pred_name.startswith('fold_') else pred_name
+            and_match = re.match(r'(.+)_and_(.+)', name_part)
+            if and_match:
+                bait_name, prey_name = and_match.group(1), and_match.group(2)
+            else:
+                bait_name, prey_name = name_part, ""
+            self.predictions.append({
+                'name': pred_name,
+                'bait': bait_name,
+                'prey': prey_name,
+                'prediction_dir': str(self.af3_folder),
+                'format': 'server_flat',
+            })
+            return self.predictions
+
         for d in sorted(self.af3_folder.iterdir()):
             if not d.is_dir() or d.name.startswith('seed-') or d.name.startswith('.'):
                 continue
 
             # Resolve AF3 Server extra nesting (name/name/)
             resolved = resolve_prediction_dir(d)
+
+            # AF3 Server flat prediction folder inside the scanned directory
+            if _is_af3_server_flat(resolved):
+                pred_name = resolved.name
+                name_part = pred_name[5:] if pred_name.startswith('fold_') else pred_name
+                and_match = re.match(r'(.+)_and_(.+)', name_part)
+                if and_match:
+                    bait_name, prey_name = and_match.group(1), and_match.group(2)
+                else:
+                    bait_name, prey_name = name_part, ""
+                self.predictions.append({
+                    'name': pred_name,
+                    'bait': bait_name,
+                    'prey': prey_name,
+                    'prediction_dir': str(resolved),
+                    'format': 'server_flat',
+                })
+                continue
+
             pred_name = resolved.name
             match = re.match(r'(.+)_and_(.+)', pred_name)
             if match:
