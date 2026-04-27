@@ -284,6 +284,73 @@ def extract_chain_indices(confidences: Dict) -> Tuple[List[int], List[int], List
     return all_indices, chain_a, chain_b, chain_indices
 
 
+def count_interface_contacts(
+    pae_matrix: np.ndarray,
+    chain_a_coords: List[Optional[Tuple[float, float, float]]],
+    chain_b_coords: List[Optional[Tuple[float, float, float]]],
+    chain_a_indices_in_pae: List[int],
+    chain_b_indices_in_pae: List[int],
+    distance_cutoff: float = 8.0,
+    pae_cutoff_pae8: float = 8.0,
+    interface_pae_cutoff: float = 6.0,
+) -> Tuple[Dict[str, int], Set[int]]:
+    """
+    Shared PAE+distance contact counter used by both AF3 and AF2 analyzers.
+
+    Bins inter-chain residue pairs by PAE threshold (≤3, ≤5, ≤8 Å PAE) when
+    they are also spatially within distance_cutoff Å (CB/CA). Returns the
+    per-threshold counts plus the set of PAE-matrix token indices of residues
+    that form the (PAE ≤ interface_pae_cutoff) interface — used by callers to
+    compute interface pLDDT.
+
+    chain_a_coords[i] corresponds to the residue at chain_a_indices_in_pae[i].
+    A coord of None means that residue has no usable representative atom
+    (skipped). Same convention for chain_b.
+    """
+    counts = {'pae3': 0, 'pae5': 0, 'pae8': 0}
+    interface_residue_indices: Set[int] = set()
+
+    if pae_matrix.size == 0:
+        return counts, interface_residue_indices
+
+    pae_rows, pae_cols = pae_matrix.shape
+
+    for i, a_idx in enumerate(chain_a_indices_in_pae):
+        if a_idx < 0 or a_idx >= pae_rows:
+            continue
+        coord_a = chain_a_coords[i] if i < len(chain_a_coords) else None
+        if coord_a is None:
+            continue
+
+        for j, b_idx in enumerate(chain_b_indices_in_pae):
+            if b_idx < 0 or b_idx >= pae_cols:
+                continue
+            pae_val = pae_matrix[a_idx, b_idx]
+            if pae_val > pae_cutoff_pae8:
+                continue
+            coord_b = chain_b_coords[j] if j < len(chain_b_coords) else None
+            if coord_b is None:
+                continue
+            dx = coord_a[0] - coord_b[0]
+            dy = coord_a[1] - coord_b[1]
+            dz = coord_a[2] - coord_b[2]
+            dist = (dx*dx + dy*dy + dz*dz) ** 0.5
+            if dist > distance_cutoff:
+                continue
+
+            if pae_val <= 3:
+                counts['pae3'] += 1
+            if pae_val <= 5:
+                counts['pae5'] += 1
+            counts['pae8'] += 1
+
+            if pae_val <= interface_pae_cutoff:
+                interface_residue_indices.add(int(a_idx))
+                interface_residue_indices.add(int(b_idx))
+
+    return counts, interface_residue_indices
+
+
 def calculate_interface_contacts(cif_path: Path, confidences: Dict,
                                  pae_cutoff: float = 10.0,
                                  distance_cutoff: float = 8.0) -> List[Dict]:
@@ -416,7 +483,8 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
 
         # Count interface contacts and collect interface residues for pLDDT
         contacts_pae3 = contacts_pae5 = contacts_pae8 = 0
-        interface_residue_indices = set()  # token indices of interface residues
+        interface_residue_indices: Set[int] = set()
+        parser = None
         if cif_path:
             parser = CIFParser(str(cif_path))
             if parser.parse_atoms():
@@ -434,51 +502,23 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
                         if name == 'CB' or (name == 'CA' and key not in cb_coords):
                             cb_coords[key] = (atom['x'], atom['y'], atom['z'])
 
-                    for i, res_a in enumerate(chain_a_res):
-                        a_idx = chain_a_indices[i] if i < len(chain_a_indices) else -1
-                        if a_idx < 0:
-                            continue
-                        coord_a = cb_coords.get((chain_a_id, res_a))
-                        if coord_a is None:
-                            continue
+                    # Align per-residue coords with the PAE token indices for each chain
+                    chain_a_coords = [cb_coords.get((chain_a_id, r)) for r in chain_a_res]
+                    chain_b_coords = [cb_coords.get((chain_b_id, r)) for r in chain_b_res]
+                    a_idxs = chain_a_indices[:len(chain_a_res)]
+                    b_idxs = chain_b_indices[:len(chain_b_res)]
 
-                        for j, res_b in enumerate(chain_b_res):
-                            b_idx = chain_b_indices[j] if j < len(chain_b_indices) else -1
-                            if b_idx < 0 or a_idx >= len(pae_matrix) or b_idx >= pae_matrix.shape[1]:
-                                continue
-
-                            # PAE check first — cheap array lookup
-                            pae_val = pae_matrix[a_idx, b_idx]
-                            if pae_val > 8.0:
-                                continue
-
-                            # Distance check only for PAE-passing pairs
-                            coord_b = cb_coords.get((chain_b_id, res_b))
-                            if coord_b is None:
-                                continue
-                            dx = coord_a[0] - coord_b[0]
-                            dy = coord_a[1] - coord_b[1]
-                            dz = coord_a[2] - coord_b[2]
-                            dist = (dx*dx + dy*dy + dz*dz) ** 0.5
-                            if dist > 8.0:
-                                continue
-
-                            # Both filters passed — bin by PAE threshold
-                            if pae_val <= 3:
-                                contacts_pae3 += 1
-                            if pae_val <= 5:
-                                contacts_pae5 += 1
-                            contacts_pae8 += 1
-
-                            # Track interface residues (PAE ≤ 6Å) for pLDDT calc
-                            if pae_val <= 6.0:
-                                interface_residue_indices.add(a_idx)
-                                interface_residue_indices.add(b_idx)
+                    counts, interface_residue_indices = count_interface_contacts(
+                        pae_matrix, chain_a_coords, chain_b_coords, a_idxs, b_idxs,
+                    )
+                    contacts_pae3 = counts['pae3']
+                    contacts_pae5 = counts['pae5']
+                    contacts_pae8 = counts['pae8']
 
         # Calculate interface pLDDT from spatially-validated interface residues only
         atom_plddts = confidences.get('atom_plddts', [])
         interface_plddt = 0.0
-        if atom_plddts and interface_residue_indices and cif_path:
+        if atom_plddts and interface_residue_indices and parser is not None:
             # Map interface token indices back to (chain_id, res_id)
             token_chain_ids = confidences.get('token_chain_ids', [])
             token_res_ids = confidences.get('token_res_ids', [])
@@ -497,9 +537,6 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
 
             if interface_plddt_values:
                 interface_plddt = float(np.mean(interface_plddt_values))
-        elif atom_plddts and not interface_residue_indices:
-            # No spatially-validated interface — fall back to 0
-            interface_plddt = 0.0
 
         # Calculate fraction disordered
         fraction_disordered = summary.get('fraction_disordered', 0)
@@ -525,25 +562,10 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
         return None
 
 
-def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0,
-                                   top_only: bool = False) -> List[Dict]:
-    """
-    Analyze models in a prediction directory.
-
-    Supports both local AF3 pipeline format (seed-N_sample-M subdirs +
-    ranking_scores.csv) and AF3 Server flat format (fold_*_model_N.cif +
-    fold_*_full_data_N.json files directly in the folder).
-
-    Args:
-        top_only: If True, only analyze the top-ranked model.
-    Returns list of analysis results, one per model.
-    """
-    from core.scanner import resolve_prediction_dir, _is_af3_server_flat
-    pred_dir = resolve_prediction_dir(pred_dir)
-
-    if _is_af3_server_flat(pred_dir):
-        return _analyze_server_flat(pred_dir, ipsae_pae_cutoff, top_only)
-
+def _analyze_af3_local(pred_dir: Path, ipsae_pae_cutoff: float = 10.0,
+                        top_only: bool = False) -> List[Dict]:
+    """Analyze an AF3 local-pipeline prediction folder (seed-*_sample-* subdirs
+    and ranking_scores.csv)."""
     results = []
     pred_name = pred_dir.name
     prefix = pred_name
@@ -569,9 +591,40 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
                      int(top_ranked['sample']) == sample)
             result['is_top_ranked'] = is_top
             result['prediction_name'] = pred_name
+            result.setdefault('format', 'af3_local')
             results.append(result)
 
     return results
+
+
+def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0,
+                                   top_only: bool = False,
+                                   format: Optional[str] = None) -> List[Dict]:
+    """
+    Analyze models in a prediction directory. Dispatches on the detected
+    format: AF3 local pipeline, AF3 Server flat, or AF2 (ranked_*.pdb +
+    ranking_debug.json, flat or in a seq/ subdir).
+
+    Args:
+        top_only: If True, only the top-ranked model is analyzed.
+        format: Optional explicit format override — skips auto-detection.
+                One of 'af3_local', 'af3_server_flat', 'af2'.
+    Returns list of analysis results, one per model.
+    """
+    from core.scanner import resolve_prediction_dir, detect_format
+    pred_dir = resolve_prediction_dir(pred_dir)
+
+    fmt = format or detect_format(pred_dir)
+
+    if fmt == 'af3_server_flat':
+        return _analyze_server_flat(pred_dir, ipsae_pae_cutoff, top_only)
+    if fmt == 'af2':
+        # Lazy import to avoid importing gemmi when not needed
+        from core.af2_analyzer import analyze_af2_prediction_all_models
+        return analyze_af2_prediction_all_models(pred_dir, ipsae_pae_cutoff, top_only)
+    if fmt == 'af3_local':
+        return _analyze_af3_local(pred_dir, ipsae_pae_cutoff, top_only)
+    return []
 
 
 def _analyze_server_flat(pred_dir: Path, ipsae_pae_cutoff: float = 10.0,
@@ -662,6 +715,7 @@ def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
 
         contacts_pae3 = contacts_pae5 = contacts_pae8 = 0
         interface_residue_indices: Set[int] = set()
+        parser = None
 
         if cif_path.exists():
             parser = CIFParser(str(cif_path))
@@ -679,42 +733,22 @@ def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
                         if name == 'CB' or (name == 'CA' and key not in cb_coords):
                             cb_coords[key] = (atom['x'], atom['y'], atom['z'])
 
-                    for i, res_a in enumerate(chain_a_res):
-                        a_idx = chain_a_indices[i] if i < len(chain_a_indices) else -1
-                        if a_idx < 0:
-                            continue
-                        coord_a = cb_coords.get((chain_a_id, res_a))
-                        if coord_a is None:
-                            continue
-                        for j, res_b in enumerate(chain_b_res):
-                            b_idx = chain_b_indices[j] if j < len(chain_b_indices) else -1
-                            if b_idx < 0 or a_idx >= len(pae_matrix) or b_idx >= pae_matrix.shape[1]:
-                                continue
-                            pae_val = pae_matrix[a_idx, b_idx]
-                            if pae_val > 8.0:
-                                continue
-                            coord_b = cb_coords.get((chain_b_id, res_b))
-                            if coord_b is None:
-                                continue
-                            dx = coord_a[0] - coord_b[0]
-                            dy = coord_a[1] - coord_b[1]
-                            dz = coord_a[2] - coord_b[2]
-                            dist = (dx*dx + dy*dy + dz*dz) ** 0.5
-                            if dist > 8.0:
-                                continue
-                            if pae_val <= 3:
-                                contacts_pae3 += 1
-                            if pae_val <= 5:
-                                contacts_pae5 += 1
-                            contacts_pae8 += 1
-                            if pae_val <= 6.0:
-                                interface_residue_indices.add(a_idx)
-                                interface_residue_indices.add(b_idx)
+                    chain_a_coords = [cb_coords.get((chain_a_id, r)) for r in chain_a_res]
+                    chain_b_coords = [cb_coords.get((chain_b_id, r)) for r in chain_b_res]
+                    a_idxs = chain_a_indices[:len(chain_a_res)]
+                    b_idxs = chain_b_indices[:len(chain_b_res)]
+
+                    counts, interface_residue_indices = count_interface_contacts(
+                        pae_matrix, chain_a_coords, chain_b_coords, a_idxs, b_idxs,
+                    )
+                    contacts_pae3 = counts['pae3']
+                    contacts_pae5 = counts['pae5']
+                    contacts_pae8 = counts['pae8']
 
         # Interface pLDDT
         atom_plddts = confidences.get('atom_plddts', [])
         interface_plddt = 0.0
-        if atom_plddts and interface_residue_indices and cif_path.exists():
+        if atom_plddts and interface_residue_indices and parser is not None:
             token_chain_ids = confidences.get('token_chain_ids', [])
             token_res_ids = confidences.get('token_res_ids', [])
             interface_residues = set()
@@ -744,7 +778,7 @@ def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
             'fraction_disordered': float(summary.get('fraction_disordered', 0)),
             'pae_mean': float(np.mean(pae_matrix)) if pae_matrix.size > 0 else 0,
             'cif_path': str(cif_path) if cif_path.exists() else None,
-            'format': 'server_flat',
+            'format': 'af3_server_flat',
         }
 
     except Exception as e:

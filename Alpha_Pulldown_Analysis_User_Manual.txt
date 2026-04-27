@@ -1,0 +1,940 @@
+================================================================================
+  ALPHA PULLDOWN ANALYSIS - WEB APPLICATION USER MANUAL
+================================================================================
+
+  Version:  April 2026
+  URL:      http://localhost:8501 (or assigned server address)
+
+  Supports:  AlphaFold 3 (local pipeline + AF3 Server flat format)
+             AlphaFold 2 (ColabFold/standard layouts: ranked_*.pdb)
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  1. Overview
+  2. Getting Started
+     2.1  Launching the App
+     2.2  Selecting a Project Folder
+     2.3  Expected Data Layout (AF3 + AF2)
+  3. Workflow Steps
+     3.1  Step 1 - Load Data
+     3.2  Step 2 - Analyze
+     3.3  Step 3 - Results
+     3.4  Step 4 - Detailed Analysis
+  4. Confidence Metrics Explained
+     4.1  iPTM (Interface Predicted TM-score)
+     4.2  PTM (Predicted TM-score)
+     4.3  iPTM+pTM (combined AF2 score)
+     4.4  Ranking Score
+     4.5  ipSAE (Interface Predicted Superposition Alignment Error)
+     4.6  Interface pLDDT
+     4.7  PAE (Predicted Aligned Error)
+     4.8  Interface Contact Counts
+  5. The Analysis Pipeline in Detail
+     5.1  What AlphaFold 2 / 3 Provide
+     5.2  What This App Computes
+     5.3  Interface Contact Detection
+     5.4  Chemical Interaction Classification
+     5.5  Hub Residue Detection
+  6. 3D Structure Viewer
+     6.1  Viewing Structures
+     6.2  PAE Interface Coloring
+  7. PyMOL Script Generation
+  8. Exporting Data
+  9. Settings and Configuration
+  10. Troubleshooting
+
+
+================================================================================
+  1. OVERVIEW
+================================================================================
+
+The Alpha Pulldown Analysis App is a web-based tool for analyzing
+AlphaFold 2 and AlphaFold 3 pulldown protein-protein interaction
+prediction data. It is designed for systematic screening experiments
+where a bait protein is tested against many candidate interaction
+partners (preys).
+
+PAIRWISE-ONLY: The app scores the interface between the FIRST TWO
+chains of each prediction. Predictions with three or more chains are
+still listed and visualized, but their interface metrics are limited
+to chain A vs chain B and the entry is flagged with a warning marker.
+
+Three prediction formats are auto-detected per folder:
+  - AF3 local pipeline:    seed-N_sample-M/ subfolders with model.cif
+                           and confidences.json
+  - AF3 Server flat:       fold_*_model_N.cif files directly in the folder
+  - AF2 standard:          ranked_N.pdb + ranked_N_PAE.csv +
+                           ranked_N_pLDDT.csv + ranking_debug.json,
+                           either flat in the folder or in a seq/ subdir
+
+Key capabilities:
+
+  - Auto-detects AF3 local, AF3 Server, and AF2 inputs side-by-side in
+    the same project tree
+  - Loads confidence metrics for all 5 models per prediction (not just
+    the top-ranked one)
+  - Computes additional metrics beyond what AF2/AF3 provides: ipSAE
+    (Dunbrack 2025), interface pLDDT, and spatially validated contact
+    counts
+  - Interactive 3D structure viewer with PAE-based interface coloring
+    (bundled 3Dmol.js, fully offline)
+  - PAE matrix visualization with interface zoom and model comparison
+  - Detailed interface contact analysis with chemical interaction typing
+  - PyMOL script generation for offline visualization
+  - Sortable, filterable results table with CSV and Excel export
+  - SLURM cluster support for large-scale AF3 analyses
+
+Why analyze all 5 models?
+
+Both AF2 and AF3 generate 5 models per prediction (AF2 ranked_0..4,
+AF3 seeds 0-4 each with samples) and select one as "top-ranked" based
+on an internal ranking score. The top-ranked model is not always the
+most informative — some interactions show strong signal in only 1-2 of
+the 5 models, and comparing across all models gives a more complete
+picture of prediction confidence. By default only the top-ranked model
+is analyzed for speed; tick "Analyze all 5 models" in Step 2 for the
+full picture.
+
+
+================================================================================
+  2. GETTING STARTED
+================================================================================
+
+2.1  LAUNCHING THE APP
+----------------------
+
+Option A - Using the launcher script (recommended):
+
+    ./run.sh
+
+This activates the Python virtual environment and starts Streamlit.
+
+Option B - Manual launch:
+
+    source .venv/bin/activate
+    streamlit run app.py
+
+The app opens in your browser at http://localhost:8501.
+
+
+2.2  SELECTING A PROJECT FOLDER
+-------------------------------
+
+When the app starts, point it to a project folder containing your
+AlphaFold predictions.
+
+  - Type the full path directly into the "Project folder" text field, OR
+  - Use the folder browser to navigate to the correct directory
+  - Click "Select this folder" when you have found your project
+
+The app auto-detects the predictions location:
+  - If <project>/AF3/ exists, it uses that subdirectory
+  - Otherwise it uses <project>/ itself
+  - Per-prediction subfolders are then classified as AF3 local, AF3
+    Server flat, or AF2
+
+SCANNING FOR PREDICTIONS RECURSIVELY:
+
+If you have many subprojects spread across a directory tree (e.g.
+multiple bait proteins each with their own pulldown data), use the
+"Scan for AlphaFold predictions" button in the folder browser. This
+recursively searches the current directory for any folders containing
+AF2 or AF3 prediction data and presents them as a selectable list with
+format badges. The scan is opt-in (button-triggered) to avoid slowdowns
+on large directory trees.
+
+
+2.3  EXPECTED DATA LAYOUT
+-------------------------
+
+Three layouts are supported and auto-detected:
+
+  AF3 LOCAL PIPELINE (default for in-house AF3 runs):
+
+    <project>/
+      AF3/
+        <bait>_and_<prey>/                   (one folder per prediction)
+          ranking_scores.csv                 (seed/sample ranking)
+          summary_confidences.json           (iPTM, PTM, ranking score)
+          seed-0_sample-0/
+            model.cif                        (3D structure)
+            confidences.json                 (PAE matrix, pLDDT)
+            summary_confidences.json
+          seed-1_sample-0/
+            ...
+          (up to 5 seed/sample directories)
+
+    Folder naming convention: <bait_accession>_and_<prey_accession>
+    where accessions are UniProt IDs (e.g. q9bw83_and_p12345). This
+    enables automatic gene name annotation via the UniProt API.
+
+  AF3 SERVER FLAT FORMAT (downloaded from the AlphaFold Server):
+
+    <project>/
+      fold_<bait>_<prey>/
+        fold_<bait>_<prey>_model_0.cif       (5 models, indices 0..4)
+        fold_<bait>_<prey>_model_1.cif
+        ...
+        fold_<bait>_<prey>_summary_confidences_0.json
+        ...
+        fold_<bait>_<prey>_full_data_0.json  (PAE matrix, pLDDT)
+        ...
+
+  AF2 STANDARD (ColabFold / standard AF2 output):
+
+    <project>/
+      <pred_name>/                           (e.g. Arl13B_INPP5E
+                                              or Hs_ADCY3_ADCY6_ANKMY2)
+        ranking_debug.json                   (iPTM+pTM scores, order)
+        ranked_0.pdb ... ranked_4.pdb        (5 models, ranked best-first)
+        ranked_0_PAE.csv ... ranked_4_PAE.csv
+        ranked_0_pLDDT.csv ... ranked_4_pLDDT.csv
+
+    Some pipelines write AF2 outputs into a seq/ subdirectory:
+
+    <project>/
+      <pred_name>/
+        seq/
+          ranking_debug.json
+          ranked_*.pdb / *_PAE.csv / *_pLDDT.csv
+
+    Both layouts are detected automatically. AF2 folder names are
+    typically <gene1>_<gene2> or <species>_<gene1>_<gene2>(_<gene3>);
+    a leading two-letter species prefix (Hs_, Mm_, Cr_, ...) is stripped
+    when guessing the bait/prey names.
+
+
+================================================================================
+  3. WORKFLOW STEPS
+================================================================================
+
+The app is organized as a 4-step workflow. Navigate between steps using
+the horizontal step selector at the top of the page.
+
+
+3.1  STEP 1 - LOAD DATA
+------------------------
+
+Purpose: Scan the predictions directory and display an overview.
+
+What it shows:
+  - Total number of predictions found, broken down by format when mixed
+  - Summary statistics (average iPTM, number of high-confidence hits)
+  - iPTM distribution histogram
+  - Two tabs:
+      "Top Predictions" - table of the highest-scoring predictions
+      "All Models"      - expanded view including all seed/sample models
+  - A warning marker on entries with three or more chains
+
+Data is loaded lazily from the lightweight per-prediction summary files
+only (no heavy parsing). Results are cached for 5 minutes to avoid
+redundant disk reads.
+
+
+3.2  STEP 2 - ANALYZE
+----------------------
+
+Purpose: Run the full analysis pipeline across all predictions.
+
+The page shows the prediction count broken down by format, e.g.:
+"Found 47 predictions to analyze (32 AF2, 15 AF3 local)".
+
+If a results cache already exists, you can either:
+  - Open the cached results directly via "Next: View Results"
+  - Re-run the analysis using the controls below (e.g. after changing
+    the PAE cutoff, after adding new predictions, or to re-run all
+    five models instead of only the top-ranked one). Tick "Skip
+    predictions already in cache" to incrementally analyze only new
+    predictions.
+
+Two execution modes are available:
+
+  LOCAL ANALYSIS (tab "Local"):
+    Runs on the machine hosting the app using Python multiprocessing.
+    - Choose the number of CPU cores (default: 8)
+    - Set the PAE cutoff for ipSAE calculation (default: 10 Angstrom)
+    - Toggle "Analyze all 5 models" to process every model
+      (default: top-ranked model only)
+    - Optionally enable "Skip predictions already in cache" to
+      incrementally analyze new predictions only
+    - Click the analysis button and monitor progress via the bar
+
+  SLURM CLUSTER (tab "Cluster"):
+    For large AF3 datasets (hundreds to thousands of predictions).
+    - Default: 6 jobs (one per CPU node), 64 CPUs, 128G RAM each
+    - Jobs are submitted and monitored within the app
+    - When all jobs complete, results are automatically merged
+    - AF2 analysis is local-only for now; the SLURM tab tells you when
+      a folder is AF2-only and disables submission. For mixed folders,
+      the SLURM path runs the AF3 subset and AF2 must be run locally.
+
+What the analysis computes per model:
+  - ipSAE score (see Section 4.5)
+  - Interface pLDDT (see Section 4.6)
+  - Interface contact counts at PAE thresholds of 3, 5, and 8 Angstrom
+
+Results are saved to:
+  - af3_app_all_models_analysis.json (combined results for all
+    predictions; the file name keeps the af3_ prefix for backwards
+    compatibility even when the cache contains AF2 results)
+  - af3_app_analysis.json inside each prediction folder (fast lookup)
+  - af3_app_analysis_summary.txt (human-readable summary)
+
+
+3.3  STEP 3 - RESULTS
+----------------------
+
+Purpose: Browse, filter, sort, and export analysis results.
+
+The results table shows one row per model with columns:
+
+  Bait / Prey    Gene names (or accessions / folder name for AF2)
+  Model          Which model: "Top" / seed-N_sample-M (AF3) or
+                 ranked_N (AF2)
+  iPTM           Interface predicted TM-score (AF3); for AF2 the
+                 combined iPTM+pTM is shown in the same column
+  ipSAE          Interface predicted superposition alignment error (computed)
+  Ranking Score  AF3's internal ranking score (AF2: same as iPTM+pTM)
+  iPLDDT         Interface pLDDT (computed)
+  PAE<=3/5/8     Interface contact counts at PAE thresholds
+
+Filtering options:
+  - Confidence tier filter (All / High / Medium / Low / Very Low)
+  - iPTM range slider
+  - Show all models vs. top-ranked only
+  - Sort by ipSAE, iPTM, ranking score, interface pLDDT, or contact count
+
+Row selection: Click any row in the table to select it, then click
+"Go to Detailed Analysis" to jump to Step 4 for that prediction.
+
+Export: Download as CSV or Excel (.xlsx) using the buttons below the
+table.
+
+
+3.4  STEP 4 - DETAILED ANALYSIS
+--------------------------------
+
+Purpose: Deep-dive into a single prediction. Works for AF2 and AF3.
+
+Select a prediction using the dropdown (searchable by gene name or
+UniProt ID for AF3; by folder name for AF2). The top-ranked model is
+selected by default; other models can be chosen from the model selector.
+For AF2, models are labelled ranked_0 .. ranked_4 with the iPTM+pTM
+score; for AF3, seed-N_sample-M with the ranking score.
+
+Six analysis tabs are available:
+
+  TAB: 3D Structure
+    Interactive 3Dmol.js viewer showing the predicted complex structure
+    (CIF for AF3, PDB for AF2, with hydrogens stripped from AF2 PDB
+    files for compactness). Interface residues are automatically
+    colored by PAE confidence:
+      Forest green  = PAE < 3 Angstrom  (very high confidence)
+      Green         = PAE 3-5 Angstrom  (high confidence)
+      Yellow        = PAE 5-8 Angstrom  (moderate confidence)
+      Orange        = PAE 8-12 Angstrom (lower confidence)
+      Muted blue    = Chain A non-interface residues
+      Muted salmon  = Chain B non-interface residues
+    PAE coloring is always on. If no confident interface residues are
+    detected (no residue pairs with PAE < 12 Angstrom AND Cbeta distance
+    < 8 Angstrom), a message is shown.
+    Viewer controls: left-drag = rotate, right-drag = pan, scroll = zoom.
+    The 3Dmol.js library is bundled inline in the iframe — no internet
+    or working static-file server required.
+
+  TAB: PAE Plots
+    Full PAE matrix heatmap with chain boundaries (black lines) and
+    interface quadrants (red dashed rectangles).
+    Green = low PAE (high confidence), White = high PAE (low confidence).
+    Below: interface zoom showing the inter-chain PAE block only.
+    Download buttons for both plots with descriptive filenames.
+
+  TAB: Interface Contacts
+    Detailed contact analysis including:
+      - Total contact count, mean PAE, mean distance, interface area
+      - Chemical interaction type breakdown (bar chart):
+        hydrophobic, hydrogen bond, salt bridge, aromatic, polar, other
+      - Contact table with residue identities, distances, and PAE values
+      - Hub residues: residues making 3+ contacts (key interface anchors)
+      - Interface sequence regions with coverage percentages
+
+  TAB: Model Comparison
+    Side-by-side comparison of all 5 models. The columns differ by format:
+      - AF3: iPTM, PTM, ipSAE, iPLDDT, contact counts, ranking score
+      - AF2: iPTM+pTM (single column), ipSAE, iPLDDT, contact counts
+    Bottom: PAE matrix thumbnails for visual comparison across all models.
+
+  TAB: PyMOL Scripts
+    Generate downloadable .py scripts for offline PyMOL visualization.
+    Scripts include:
+      - Chain coloring (light blue / light orange)
+      - PAE-tier interface coloring (same scheme as 3D viewer)
+      - Interface residues shown as sticks
+      - Hub residues shown as spheres
+      - Convenience commands: show_interface, show_contacts, show_pae_only
+    PyMOL infers the file format from the extension (.cif for AF3,
+    .pdb for AF2), so the same script template works for both.
+    Usage: In PyMOL, File -> Run Script -> select the downloaded .py file.
+
+  TAB: Export
+    Download PAE matrix as CSV and interface contacts as CSV for the
+    currently selected model.
+
+
+================================================================================
+  4. CONFIDENCE METRICS EXPLAINED
+================================================================================
+
+Understanding the metrics is essential for interpreting pulldown
+results. The app combines built-in AF2/AF3 metrics with additional
+computed scores.
+
+
+4.1  iPTM (Interface Predicted TM-score)
+-----------------------------------------
+
+Source: Provided by AlphaFold 3 in summary_confidences.json (AF2 does
+not separate iPTM from pTM — see Section 4.3)
+
+Range: 0 to 1 (higher = better)
+
+What it measures: The predicted structural similarity of the
+protein-protein interface to the true structure, analogous to TM-score
+but focused on the inter-chain region.
+
+Interpretation (AF3):
+  > 0.8   High confidence interaction
+  0.6-0.8 Moderate confidence
+  0.4-0.6 Low confidence
+  < 0.4   Very low confidence / likely no interaction
+
+Limitations: iPTM can be inflated for predictions where chains pack
+together due to hydrophobic collapse rather than a true biological
+interface. It is a global metric that does not distinguish between
+well-predicted and poorly-predicted parts of the interface.
+
+
+4.2  PTM (Predicted TM-score)
+-----------------------------
+
+Source: Provided by AlphaFold 3 (AF2 reports a combined iPTM+pTM only)
+
+Range: 0 to 1
+
+What it measures: Overall structural prediction quality for the full
+complex (not just the interface). A high PTM means the individual
+chain folds are likely correct.
+
+Note: A prediction can have high PTM but low iPTM if the chains fold
+well individually but the docking orientation is uncertain.
+
+
+4.3  iPTM+pTM (combined AF2 score)
+----------------------------------
+
+Source: Provided by AlphaFold 2 / ColabFold in ranking_debug.json
+
+Range: 0 to 1 (higher = better)
+
+What it measures: AF2's standard ranking metric for protein-protein
+complexes — a weighted combination of iPTM and pTM:
+    iPTM+pTM = 0.8 * iPTM + 0.2 * pTM
+The two contributions are not separately reported by AF2/ColabFold,
+so the app shows the combined value in a single "iPTM+pTM" column on
+the Detailed Analysis page (and uses it as the AF2 ranking score).
+
+Conventional AF2 interpretation thresholds:
+  > 0.8   High confidence
+  0.7-0.8 Promising
+  0.5-0.7 Low confidence
+  < 0.5   Very low confidence
+
+For cross-format comparison the app uses the unified ipSAE-based tier
+system (Section 4.5) instead, which is computed from the PAE matrix
+and is meaningful for both AF2 and AF3 outputs.
+
+
+4.4  Ranking Score
+------------------
+
+Source: AF3 ranking_scores.csv; for AF2 the ranking score is taken to
+be iPTM+pTM (AF2 has no separate ranking metric)
+
+What it measures: The composite score used to select the "top-ranked"
+model from the 5 generated models.
+
+
+4.5  ipSAE (Interface Predicted Superposition Alignment Error)
+--------------------------------------------------------------
+
+Source: Computed by this app from the PAE matrix (works for AF2 and
+AF3 alike — the formula only depends on the PAE matrix and chain
+indices)
+
+Range: 0 to 1 (higher = better)
+
+Reference: Dunbrack 2025
+
+What it measures: A normalized interface confidence score derived from
+the Predicted Aligned Error (PAE) matrix. Unlike iPTM which is a
+single global score, ipSAE is computed directly from the residue-level
+PAE values at the interface.
+
+How it is calculated:
+
+  1. For each residue i in chain A, extract the PAE values to all
+     residues in chain B: PAE(i, j) for all j in chain B.
+
+  2. Filter: keep only PAE values below the cutoff (default 10 Angstrom).
+     If no values pass, this residue contributes nothing.
+
+  3. For the L remaining values, compute a length-dependent distance
+     parameter:
+       d_0 = 1.24 * (L - 15)^(1/3) - 1.8    if L >= 27
+       d_0 = 1.0                               if L < 27
+
+  4. Compute a per-residue score:
+       S_i = mean[ 1 / (1 + (PAE_j / d_0)^2) ]   for all filtered j
+
+  5. The asymmetric ipSAE(A->B) is the maximum S_i across all residues
+     in chain A.
+
+  6. Repeat in the other direction: ipSAE(B->A).
+
+  7. Final ipSAE = max[ ipSAE(A->B), ipSAE(B->A) ]
+
+Interpretation:
+  > 0.7   High confidence (reliable interface)
+  0.5-0.7 Medium confidence
+  0.3-0.5 Low confidence
+  < 0.3   Very low confidence
+
+Why ipSAE is useful: It is more sensitive than iPTM for detecting
+partial interfaces where only a subset of residues are confidently
+placed. It also correlates better with actual interface accuracy
+(Dunbrack 2025) and provides a single tier system that works across
+both AF2 and AF3 results.
+
+PAE cutoff note: The 10 Angstrom default for ipSAE calculation means
+only residue pairs where the model predicts their relative position
+within 10 Angstrom contribute to the score. This cutoff does NOT
+filter out predictions — all predictions are analyzed regardless. A
+prediction with no PAE values below 10 Angstrom will simply have
+ipSAE = 0.
+
+
+4.6  Interface pLDDT
+--------------------
+
+Source: Computed by this app
+  - AF3: from the per-atom atom_plddts in confidences.json
+  - AF2: from per-residue pLDDT in ranked_N_pLDDT.csv
+
+Range: 0 to 100 (higher = better)
+
+What it measures: The average pLDDT (predicted local distance
+difference test) over residues at the protein-protein interface.
+
+How it is calculated:
+
+  1. Interface residues are identified by the dual-filter criterion:
+     - Inter-chain PAE <= 6 Angstrom AND
+     - Cbeta-Cbeta spatial distance <= 8 Angstrom
+
+  2. For each interface residue, the relevant pLDDT values are
+     collected (per-atom for AF3, per-residue for AF2).
+
+  3. Interface pLDDT = mean of all collected pLDDT values.
+
+Interpretation:
+  > 90    Very high confidence (backbone and side chains well-placed)
+  70-90   High confidence (backbone reliable, some side chain uncertainty)
+  50-70   Low confidence (significant uncertainty)
+  < 50    Very low confidence (likely disordered or incorrectly modeled)
+
+Note: If no interface residues pass the dual filter, interface pLDDT
+is reported as 0, indicating no confident interface was detected.
+
+
+4.7  PAE (Predicted Aligned Error)
+-----------------------------------
+
+Source:
+  - AF3: confidences.json (NxN matrix)
+  - AF2: ranked_N_PAE.csv (NxN matrix; first row/column are indices)
+
+Range: 0 to ~31.75 Angstrom (lower = better)
+
+What it measures: For each pair of residues (i, j), the PAE gives the
+expected positional error of residue j when the predicted structure
+is aligned on residue i. Low PAE between residues in different chains
+indicates the model is confident about their relative positioning.
+
+Important: The PAE matrix is asymmetric — PAE(i,j) is not necessarily
+equal to PAE(j,i). The 3D viewer and interface analysis use the
+bidirectional average: (PAE(i,j) + PAE(j,i)) / 2 for a more robust
+assessment.
+
+In the app:
+  - The PAE matrix is displayed as a heatmap (green = low/good,
+    white = high/bad)
+  - Inter-chain blocks are highlighted with red dashed rectangles
+  - Interface zoom extracts and enlarges the chain A vs chain B block
+
+
+4.8  Interface Contact Counts
+-----------------------------
+
+Source: Computed by this app using both PAE and spatial distance
+filtering. Identical formula for AF2 and AF3.
+
+Three thresholds are reported in the results table:
+  PAE <= 3 Angstrom  (very high confidence contacts)
+  PAE <= 5 Angstrom  (high confidence contacts)
+  PAE <= 8 Angstrom  (moderate confidence contacts)
+
+All contacts must also pass a Cbeta-Cbeta distance filter of 8
+Angstrom, ensuring that counted contacts are spatially plausible in
+the predicted structure, not just confident in the PAE matrix.
+
+
+================================================================================
+  5. THE ANALYSIS PIPELINE IN DETAIL
+================================================================================
+
+5.1  WHAT ALPHAFOLD 2 / 3 PROVIDE
+----------------------------------
+
+For each AF3 prediction:
+
+  - model.cif: Atomic coordinates in mmCIF format
+  - confidences.json: Full PAE matrix, per-atom pLDDT, chain assignments
+  - summary_confidences.json: iPTM, PTM, ranking score, disorder fraction
+  - ranking_scores.csv: Ranking of all 5 seed/sample models
+
+For each AF2 prediction (5 ranked_N models, N = 0..4):
+
+  - ranked_N.pdb: Atomic coordinates in PDB format (with hydrogens)
+  - ranked_N_PAE.csv: Square PAE matrix (residue-level)
+  - ranked_N_pLDDT.csv: Per-residue pLDDT values
+  - ranking_debug.json: iPTM+pTM scores per model and ranked order
+
+These are read-only inputs to the app. The app never modifies the
+original prediction files.
+
+
+5.2  WHAT THIS APP COMPUTES
+----------------------------
+
+For each model, the app computes:
+
+  1. ipSAE score from the PAE matrix (see Section 4.5) — same formula
+     for AF2 and AF3
+  2. Interface residue identification using dual PAE + distance
+     filtering
+  3. Interface pLDDT from interface-restricted pLDDT values
+  4. Contact counts at three PAE thresholds (3, 5, 8 Angstrom)
+
+Results are saved to:
+  - af3_app_all_models_analysis.json (all predictions, one file —
+    name kept stable for backwards compatibility even though it now
+    holds AF2 entries too; each entry carries a "format" field)
+  - af3_app_analysis.json per prediction folder (fast per-prediction
+    lookup)
+
+Subsequent sessions load from cache unless you re-run the analysis.
+
+
+5.3  INTERFACE CONTACT DETECTION
+---------------------------------
+
+A residue pair (i in chain A, j in chain B) is classified as an
+interface contact if BOTH conditions are met:
+
+  1. Bidirectional PAE average: (PAE(i,j) + PAE(j,i)) / 2 <= cutoff
+  2. Cbeta-Cbeta distance <= 8 Angstrom
+
+The Cbeta atom (CB) is used as the representative atom for each
+residue. For glycine (which lacks a CB), the Calpha (CA) atom is used
+instead.
+
+This dual-filter approach prevents false positives: the PAE filter
+ensures the model is confident about the relative position, while the
+distance filter ensures the residues are actually in physical
+proximity.
+
+Different PAE cutoffs are used in different contexts:
+  - ipSAE calculation:     10 Angstrom (Dunbrack 2025 recommendation)
+  - Interface contacts tab: 10 Angstrom
+  - 3D viewer coloring:    12 Angstrom (broader, for visualization)
+  - Contact counts:         3, 5, 8 Angstrom (three thresholds)
+
+Pairwise-only enforcement: For predictions with three or more chains,
+only chains A and B (the first two in PDB / chain order) are used for
+interface analysis. The rest of the structure is still rendered in the
+3D viewer but does not contribute to the metrics.
+
+
+5.4  CHEMICAL INTERACTION CLASSIFICATION
+-----------------------------------------
+
+Each interface contact is classified by chemical interaction type:
+
+  Salt bridge:     Charged residue pair (R/K/H with D/E), distance < 5.5 A
+  Hydrogen bond:   Sidechain capable of H-bonding (S/T/N/Q/Y/C/D/E/R/K/H/W),
+                   distance < 5.0 A
+  Aromatic:        Both residues aromatic (F/Y/W/H), distance < 5.5 A
+  Hydrophobic:     Both residues nonpolar (A/V/L/I/M/F/W/P/G), dist < 5.0 A
+  Polar:           Other contacts with distance < 5.0 A
+  Other:           Contacts not fitting the above categories
+
+Note: Classification is based on the representative atoms (CB/CA) and
+residue types, providing a rough categorization rather than a detailed
+atomic-level analysis.
+
+
+5.5  HUB RESIDUE DETECTION
+---------------------------
+
+Hub residues are interface residues that make 3 or more contacts with
+the partner chain. These are key anchoring points of the interface and
+are often functionally important. Hub residues are ranked by contact
+count.
+
+
+================================================================================
+  6. 3D STRUCTURE VIEWER
+================================================================================
+
+6.1  VIEWING STRUCTURES
+------------------------
+
+The 3D Structure tab in Step 4 uses 3Dmol.js to display an interactive
+viewer of the predicted complex structure. The 3Dmol.js library is
+bundled inline into the iframe (loaded from static/3Dmol-min.js at
+HTML build time), so the viewer works fully offline on air-gapped /
+HPC networks and does not depend on Streamlit's static-file server.
+
+For AF3, the original mmCIF is sent to the viewer. For AF2, the
+ranked_N.pdb file is sent with hydrogens stripped (3Dmol does not
+render H in cartoon mode and AF2 PDB files include them, which would
+otherwise inflate the iframe payload by 2-3x).
+
+Viewer controls:
+  - Left-click + drag:     Rotate the structure
+  - Right-click + drag:    Translate (pan)
+  - Scroll wheel:          Zoom in/out
+
+Each chain is shown in cartoon representation with distinct colors
+(blue for chain A, salmon for chain B, then green / purple / tan /
+teal for additional chains in trimer+ predictions).
+
+
+6.2  PAE INTERFACE COLORING
+----------------------------
+
+Interface residues are automatically colored by their best inter-chain
+PAE value. Only residues that pass BOTH filters are colored:
+
+  1. Bidirectional inter-chain PAE < 12 Angstrom
+  2. Cbeta-Cbeta spatial distance < 8 Angstrom
+
+Color scheme:
+  Forest green (#228B22):  PAE < 3 Angstrom  - very high confidence
+  Green (#00CC00):         PAE 3-5 Angstrom  - high confidence
+  Yellow (#FFDC00):        PAE 5-8 Angstrom  - moderate confidence
+  Orange (#FF7800):        PAE 8-12 Angstrom - lower confidence
+  Muted blue (#8CB4DC):    Chain A non-interface residues
+  Muted salmon (#DC9696):  Chain B non-interface residues
+
+A legend in the bottom-left corner shows the color scheme and chain
+names.
+
+If no interface residues are detected, a message is displayed:
+"No confident interface residues detected (PAE < 12 A + distance <
+8 A)". This typically indicates that the model did not predict a
+confident interaction.
+
+
+================================================================================
+  7. PYMOL SCRIPT GENERATION
+================================================================================
+
+The PyMOL Scripts tab generates downloadable .py scripts for offline
+visualization in PyMOL. This is useful for publication-quality figures
+or detailed manual inspection. Available for both AF2 and AF3
+predictions.
+
+Each script includes:
+  - Structure loading from the original .cif (AF3) or .pdb (AF2) file
+    path; PyMOL infers the format from the extension
+  - Chain coloring (light blue for chain A, light orange for chain B)
+  - PAE-tier interface coloring (same 4-tier scheme as the 3D viewer)
+  - Interface residues displayed as sticks
+  - Hub residues (3+ contacts) displayed as spheres on CA atoms
+  - Named selections for each PAE tier and chain
+  - Convenience commands registered via cmd.extend():
+      show_interface  - zoom to interface region
+      show_chain_a    - focus on chain A
+      show_chain_b    - focus on chain B
+      show_pae_only   - hide sticks/spheres, show PAE cartoon only
+      show_contacts   - show interface sticks and hub spheres
+
+Usage:
+  1. Open PyMOL
+  2. File -> Run Script -> select the downloaded .py file
+  3. Type commands in the PyMOL console (e.g., "show_interface")
+
+
+================================================================================
+  8. EXPORTING DATA
+================================================================================
+
+Results table (Step 3):
+  - CSV:   Standard comma-separated format, compatible with Excel, R,
+           Python
+  - XLSX:  Native Excel format with formatted columns
+
+PAE plots (Step 4, PAE Plots tab):
+  - Download buttons with descriptive filenames, e.g.:
+    ARL3_ARL13B_s541063_m4_PAE.png
+    ARL3_ARL13B_s541063_m4_PAE_interface.png
+
+Detailed analysis (Step 4, Export tab):
+  - PAE matrix:  Full NxN matrix as CSV (one row per residue)
+  - Contacts:    Interface contact table as CSV with residue IDs,
+                 distances, PAE values, and amino acid identities
+
+PyMOL scripts (Step 4, PyMOL Scripts tab):
+  - Downloadable .py files with descriptive filenames
+
+All exports use descriptive filenames including protein names and
+model identifiers.
+
+
+================================================================================
+  9. SETTINGS AND CONFIGURATION
+================================================================================
+
+Analysis settings are configured directly on the Analyze step (Step 2),
+not in the sidebar.
+
+LOCAL ANALYSIS SETTINGS (Step 2, Local tab):
+
+  Number of CPUs:       How many CPU cores to use for local
+                        multiprocessing. Set to the number of
+                        available cores minus 1-2 for best performance
+                        without freezing the system.
+
+  PAE cutoff:           PAE cutoff for ipSAE calculation
+                        (default: 10 Angstrom).
+
+  Analyze all models:   When checked, the analysis processes all 5
+                        models per prediction. When unchecked
+                        (default), only the top-ranked model is
+                        analyzed. Analyzing all models takes ~5x
+                        longer but provides richer data for the
+                        Model Comparison tab.
+
+  Skip predictions      When checked (cached folders only), skips
+  already in cache:     predictions already in the cache. Useful when
+                        new predictions were added to a folder that
+                        was already run. Leave unchecked if you
+                        changed the PAE cutoff or the all-models
+                        option, otherwise the cache will mix results
+                        from different settings.
+
+SLURM CLUSTER SETTINGS (Step 2, Cluster tab):
+
+  Number of jobs:       Default 6 (one per CPU node). Adjustable.
+  CPUs per job:         Default 64.
+  Memory per job:       Default 128G.
+  PAE cutoff:           Same as local analysis.
+  Analyze all models:   Same as local analysis.
+
+  AF2 caveat: SLURM submission is AF3-only for now. AF2-only folders
+  show an info banner on the SLURM tab; mixed folders run only the
+  AF3 subset on SLURM and the AF2 subset must be analyzed locally.
+
+Gene names are automatically looked up via the UniProt REST API after
+analysis completes for AF3 (the <bait>_and_<prey> folder convention
+provides the accessions). AF2 folders typically use gene names
+directly in the folder name and are not looked up. UniProt lookup
+requires internet access.
+
+
+================================================================================
+  10. TROUBLESHOOTING
+================================================================================
+
+"No predictions found"
+  - Verify the project folder contains subdirectories with AF2 or AF3
+    output files
+  - For AF3 local: check folder names follow the <bait>_and_<prey>
+    convention and that summary_confidences.json exists
+  - For AF3 Server flat: check the folder contains
+    fold_*_model_N.cif files
+  - For AF2: check that ranked_*.pdb and ranking_debug.json exist
+    either directly in the folder or in a seq/ subdirectory
+
+"Could not load confidences for seed-X_sample-Y" (AF3)
+  - The confidences.json file may be missing for that model
+  - AF3 sometimes only saves files for the top-ranked model
+  - Check the seed-X_sample-Y subdirectory exists and contains files
+
+Analysis is slow
+  - Large predictions (proteins > 1000 residues) take longer due to
+    the NxN PAE matrix and pairwise distance calculations
+  - Use the SLURM cluster option for AF3 datasets with > 100
+    predictions
+  - Increase CPU count in settings if running locally
+  - AF2 analysis is fast enough to run locally even on hundreds of
+    predictions
+
+3D viewer shows "3Dmol.js source not found"
+  - The bundled 3Dmol.js file at static/3Dmol-min.js is missing
+  - Place a copy of 3Dmol-min.js in the static/ directory or run
+    ./run.sh from the app directory so the bundled file is found
+  - All other tabs (PAE plots, interface contacts, exports) still
+    work without the 3D viewer
+
+3D viewer shows "3D viewer failed to render structure: ..."
+  - The 3Dmol.js library loaded but failed to parse the structure
+    file. The error message in the viewer area gives the JS exception
+    text — check the browser console for more detail.
+  - For AF2: confirm the PDB file is well-formed (some custom
+    pipelines emit non-standard variants).
+
+Gene names show as accession IDs
+  - UniProt API may be temporarily unavailable
+  - Some accessions may be obsolete or not found in UniProt
+  - Check internet connectivity
+  - AF2 folder names are not looked up; the folder name is used
+    directly as bait/prey in the table
+
+"Analysis results not found" in Step 3
+  - Run the analysis first (Step 2)
+  - Check that af3_app_all_models_analysis.json exists in the
+    project folder
+  - For SLURM runs, ensure all jobs completed and results were merged
+
+No PAE coloring on 3D structure
+  - This means no interface residues passed both the PAE (<12 A) and
+    distance (<8 A) filters. The model likely has no confident
+    interface.
+  - Check the PAE Plots tab to see the inter-chain PAE values
+  - A model can have moderate iPTM / iPTM+pTM but no spatially
+    validated interface
+
+Trimer / multi-chain warning
+  - The warning marker on a prediction means it has three or more chains
+  - The 3D viewer renders the full complex; interface metrics (ipSAE,
+    contacts, interface pLDDT) only score chains A vs B
+  - For higher-order interfaces, consider running pairwise predictions
+    of each chain combination separately
+
+================================================================================
+  END OF MANUAL
+================================================================================

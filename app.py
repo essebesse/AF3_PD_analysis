@@ -31,8 +31,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # App title
-st.markdown('<div class="main-header">🔬 AF3 Pulldown Analysis</div>', unsafe_allow_html=True)
-st.markdown("### Web-based analysis for AlphaFold 3 protein interaction predictions")
+st.markdown('<div class="main-header">🔬 AlphaFold Pulldown Analysis</div>', unsafe_allow_html=True)
+st.markdown("### Web-based analysis for AlphaFold 3 and AlphaFold 2 protein interaction predictions")
+
+# Pairwise-only notice: the app only scores the first two chains. Keep this
+# compact but persistent so users with 3-chain predictions see it every time.
+with st.expander("ℹ️ Scope: pairwise predictions only", expanded=False):
+    st.markdown(
+        "This app analyzes the interface between the **first two chains** of each "
+        "prediction. Predictions with three or more chains are still listed, but "
+        "their interface scoring is only Chain A vs Chain B — a ⚠️ marker flags "
+        "those rows."
+    )
 
 # Check if core modules exist
 try:
@@ -110,15 +120,15 @@ else:
     else:
         st.caption("(no subdirectories)")
 
-    # ── Recursive AF3 subproject scanner ──────────────────────────────
+    # ── Recursive AlphaFold-predictions scanner ───────────────────────
     st.divider()
-    st.markdown("##### Scan for AF3 subprojects")
-    st.caption("Recursively search for all folders containing AF3 prediction data under the current directory.")
+    st.markdown("##### Scan for AlphaFold predictions")
+    st.caption("Recursively search for all folders containing AF3 or AF2 prediction data under the current directory.")
 
-    if st.button("Scan for AF3 subprojects", key="scan_recursive"):
-        from core.scanner import find_af3_projects_recursive
+    if st.button("Scan for AlphaFold predictions", key="scan_recursive"):
+        from core.scanner import find_predictions_recursive
         with st.spinner(f"Scanning `{browse_dir}` ..."):
-            found = find_af3_projects_recursive(str(browse_dir))
+            found = find_predictions_recursive(str(browse_dir))
         st.session_state['recursive_scan_results'] = found
         st.session_state['recursive_scan_root'] = str(browse_dir)
 
@@ -127,18 +137,21 @@ else:
     scan_root = st.session_state.get('recursive_scan_root', '')
     if scan_results is not None and scan_root == str(browse_dir):
         if scan_results:
-            st.success(f"Found {len(scan_results)} AF3 project(s) under `{browse_dir.name}/`")
+            st.success(f"Found {len(scan_results)} AlphaFold project(s) under `{browse_dir.name}/`")
             for i, proj in enumerate(scan_results):
-                col_label, col_btn = st.columns([4, 1])
+                col_label, col_fmt, col_btn = st.columns([3, 1, 1])
                 with col_label:
                     st.code(proj['label'], language=None)
+                with col_fmt:
+                    badge = proj.get('format', 'unknown')
+                    st.caption(f"📄 {badge}")
                 with col_btn:
                     if st.button("Select", key=f"scanpick_{i}", type="primary"):
                         st.session_state['project_path'] = proj['project_path']
                         st.session_state.pop('recursive_scan_results', None)
                         st.rerun()
         else:
-            st.warning("No AF3 prediction data found under this directory.")
+            st.warning("No AlphaFold prediction data found under this directory.")
 
     st.divider()
 
@@ -146,7 +159,7 @@ project_path = st.session_state.get('project_path', "")
 
 if not project_path:
     st.info("Enter a project folder path above, or use Browse to navigate your filesystem. "
-            "The folder should contain AF3 prediction subdirectories (with .cif and .json files).")
+            "The folder should contain AF3 or AF2 prediction subdirectories.")
     st.stop()
 
 # Auto-detect where predictions live:
@@ -157,6 +170,62 @@ af3_folder = find_predictions_folder(project_path)
 if not af3_folder:
     st.error(f"Folder not found: {project_path}")
     st.stop()
+
+# Format override + detection chip
+from core.scanner import AF3Scanner
+FORMAT_CHOICES = ["Auto-detect", "AF3", "AF2"]
+col_fmt, col_chip = st.columns([1, 3])
+with col_fmt:
+    format_override = st.radio(
+        "Format",
+        FORMAT_CHOICES,
+        horizontal=True,
+        index=FORMAT_CHOICES.index(st.session_state.get("format_override", "Auto-detect")),
+        help=(
+            "Auto-detect inspects each prediction folder. Override if you "
+            "want to force one format."
+        ),
+        key="format_override",
+    )
+with col_chip:
+    # Summarize detected formats across all predictions in af3_folder.
+    @st.cache_data(ttl=300)
+    def _summarize_formats(folder: str):
+        preds = AF3Scanner(Path(folder)).scan()
+        counts: dict[str, int] = {}
+        pairwise_warn = 0
+        for p in preds:
+            counts[p.get('format', 'unknown')] = counts.get(p.get('format', 'unknown'), 0) + 1
+            if p.get('n_chains', 0) > 2:
+                pairwise_warn += 1
+        return counts, pairwise_warn, len(preds)
+
+    try:
+        fmt_counts, pairwise_warn, n_total = _summarize_formats(str(af3_folder))
+    except Exception as e:
+        fmt_counts, pairwise_warn, n_total = {}, 0, 0
+        st.caption(f"Could not summarize folder: {e}")
+
+    if n_total == 0:
+        st.caption("❌ No AF2 or AF3 predictions found in this folder.")
+    else:
+        label_map = {
+            'af3_local': 'AF3',
+            'af3_server_flat': 'AF3 Server',
+            'af2': 'AF2',
+            'unknown': 'unknown',
+        }
+        parts = [f"{n} {label_map.get(k, k)}" for k, n in sorted(fmt_counts.items(), key=lambda kv: -kv[1])]
+        summary = ", ".join(parts)
+        if len(fmt_counts) == 1:
+            chip = f"✅ Detected {summary} — {n_total} predictions"
+        else:
+            chip = f"⚠️ Mixed formats: {summary} ({n_total} predictions)"
+        if format_override != "Auto-detect":
+            chip += f"  ·  🔧 Format locked to **{format_override}** (ignoring auto-detect)"
+        if pairwise_warn:
+            chip += f"  ·  ⚠️ {pairwise_warn} prediction(s) with 3+ chains — pairwise A/B only"
+        st.caption(chip)
 
 # Sidebar: app info
 with st.sidebar:

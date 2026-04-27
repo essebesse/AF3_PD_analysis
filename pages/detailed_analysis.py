@@ -123,12 +123,34 @@ def show_detailed(project_path: str, af3_folder: str):
                 selected_pred = p
                 break
 
-        if selected_pred and 'iptm' in selected_pred:
-            st.metric("iPTM", format_score(selected_pred['iptm']))
-            st.metric("PTM", format_score(selected_pred['ptm']))
+        if selected_pred:
+            fmt = selected_pred.get('format', 'af3_local')
+            if fmt == 'af2':
+                iptm_ptm_val = selected_pred.get('iptm_ptm')
+                if iptm_ptm_val is None:
+                    iptm_ptm_val = selected_pred.get('iptm')
+                if iptm_ptm_val is not None:
+                    st.metric("iPTM+pTM", format_score(iptm_ptm_val))
+            else:
+                iptm_val = selected_pred.get('iptm')
+                ptm_val = selected_pred.get('ptm')
+                if iptm_val is not None:
+                    st.metric("iPTM", format_score(iptm_val))
+                if ptm_val is not None:
+                    st.metric("PTM", format_score(ptm_val))
 
     if not selected_pred:
         return
+
+    is_af2 = selected_pred.get('format') == 'af2'
+
+    n = selected_pred.get('n_chains')
+    if n and n > 2:
+        st.info(
+            f"This prediction has **{n} chains**. Pairwise scoring is limited "
+            "to chains A and B; the third chain is shown in the structure but "
+            "not in interface metrics."
+        )
 
     st.divider()
 
@@ -137,21 +159,29 @@ def show_detailed(project_path: str, af3_folder: str):
     seed_samples = selected_pred.get('seed_samples', [])
 
     if seed_samples:
-        # Find top-ranked model (highest ranking score)
-        best_ss = max(seed_samples, key=lambda ss: ss['ranking_score'])
+        # Find top-ranked model. AF2 ranks by iptm+ptm (stored as ranking_score
+        # in the seed_samples list); AF3 by ranking_score directly.
+        best_ss = max(seed_samples, key=lambda ss: ss.get('ranking_score') or 0)
         top_seed, top_sample = best_ss['seed'], best_ss['sample']
 
         # Build model options with top-ranked first (default)
+        def _model_label(ss, is_top):
+            score = ss.get('ranking_score') or 0
+            if is_af2:
+                core = f"ranked_{ss['sample']} (iPTM+pTM={score:.4f})"
+            else:
+                core = f"seed-{ss['seed']}_sample-{ss['sample']} (score={score:.4f})"
+            return f"Top-ranked — {core}" if is_top else core
+
         top_option = None
         other_options = []
         for ss in seed_samples:
             is_top = ss['seed'] == top_seed and ss['sample'] == top_sample
+            opt = (ss['seed'], ss['sample'], _model_label(ss, is_top))
             if is_top:
-                label = f"Top-ranked (seed={ss['seed']}, sample={ss['sample']}, score={ss['ranking_score']:.4f})"
-                top_option = (ss['seed'], ss['sample'], label)
+                top_option = opt
             else:
-                label = f"seed-{ss['seed']}_sample-{ss['sample']} (score={ss['ranking_score']:.4f})"
-                other_options.append((ss['seed'], ss['sample'], label))
+                other_options.append(opt)
 
         model_options = []
         if top_option:
@@ -166,10 +196,11 @@ def show_detailed(project_path: str, af3_folder: str):
 
         if selected_model:
             seed, sample = selected_model[0], selected_model[1]
+            model_label = f"ranked_{sample}" if is_af2 else f"seed-{seed}_sample-{sample}"
 
             # Load detailed data for selected model
             st.divider()
-            st.subheader(f"📊 Model: seed-{seed}_sample-{sample}")
+            st.subheader(f"📊 Model: {model_label}")
 
             import json
             import numpy as np
@@ -185,6 +216,7 @@ def show_detailed(project_path: str, af3_folder: str):
             from core.viewer_3d import generate_viewer_html, compute_interface_pae_per_residue
 
             pred_dir = Path(selected_pred['prediction_dir'])
+            af2_work_dir = Path(selected_pred['work_dir']) if is_af2 and selected_pred.get('work_dir') else None
 
             # ── Compute everything ONCE per model, store in session state ──
             model_key = f"{selected_pred_name}_{seed}_{sample}"
@@ -198,55 +230,87 @@ def show_detailed(project_path: str, af3_folder: str):
                     elif old_pred and k.startswith('_comp_plot_') and old_pred in k:
                         del st.session_state[k]
 
-                # Recompute all derived data
-                confidences = load_confidences(pred_dir, selected_pred_name, seed, sample)
-
-                chain_ids_resolved = []
-                chain_lengths_resolved = []
+                confidences = None
+                chain_ids_resolved: list = []
+                chain_lengths_resolved: list = []
                 protein_names = ['Chain A', 'Chain B']
-                if confidences is not None:
-                    chain_ids_resolved, chain_lengths_resolved = get_chain_info_from_confidences(confidences)
-                    if '_and_' in selected_pred_name:
-                        bait_acc, prey_acc = selected_pred_name.split('_and_', 1)
-                        accs = [bait_acc.upper(), prey_acc.upper()]
-                    else:
-                        accs = [selected_pred_name.upper()]
-                    protein_names = []
-                    for i, cid in enumerate(chain_ids_resolved):
-                        if i < len(accs):
-                            acc = accs[i]
-                            name = gene_cache.get(acc, acc)
-                            protein_names.append(name)
-                        else:
-                            protein_names.append(cid)
-
-                # Find CIF file
-                sample_dir = pred_dir / f"seed-{seed}_sample-{sample}"
-                cif_file = sample_dir / f"{selected_pred_name}_seed-{seed}_sample-{sample}_model.cif"
-                if not cif_file.exists():
-                    cif_file = sample_dir / "model.cif"
-                if not cif_file.exists():
-                    cif_file = pred_dir / f"{selected_pred_name}_model.cif"
-                if not cif_file.exists():
-                    cif_file = pred_dir / "model.cif"
-
-                # Compute interface PAE (uses confidences already in memory — no re-read)
+                structure_file: Path = Path('')
+                structure_format = 'cif'
+                structure_content: str = ''
                 pae_data = None
-                if confidences is not None and chain_ids_resolved and chain_lengths_resolved and cif_file.exists():
-                    pae_data = compute_interface_pae_per_residue(
-                        cif_file, confidences, chain_ids_resolved, chain_lengths_resolved
-                    )
-
-                # Build 3D viewer HTML ONCE (the only expensive part)
                 viewer_html = None
-                if cif_file.exists():
-                    cif_content = cif_file.read_text()
+
+                if is_af2 and af2_work_dir is not None:
+                    # AF2 path: synthesize confidences + load PDB
+                    from core.af2_detail import (
+                        load_af2_model_data,
+                        compute_af2_interface_pae_per_residue,
+                    )
+                    bundle = load_af2_model_data(af2_work_dir, sample)
+                    if bundle is not None:
+                        confidences = bundle['confidences']
+                        chain_ids_resolved = bundle['chain_ids']
+                        chain_lengths_resolved = bundle['chain_lengths']
+                        structure_file = bundle['pdb_path']
+                        structure_format = 'pdb'
+                        structure_content = bundle['pdb_content']
+
+                        # AF2 folder names don't follow <bait>_and_<prey>; show
+                        # gene names from the cache when the folder name happens
+                        # to match a known accession, else fall back to chain IDs
+                        protein_names = []
+                        for i, cid in enumerate(chain_ids_resolved):
+                            protein_names.append(cid if cid else f"Chain {i+1}")
+
+                        if chain_ids_resolved and chain_lengths_resolved:
+                            pae_data = compute_af2_interface_pae_per_residue(
+                                structure_file, confidences,
+                                chain_ids_resolved, chain_lengths_resolved,
+                            )
+                else:
+                    # AF3 path (unchanged)
+                    confidences = load_confidences(pred_dir, selected_pred_name, seed, sample)
+                    if confidences is not None:
+                        chain_ids_resolved, chain_lengths_resolved = get_chain_info_from_confidences(confidences)
+                        if '_and_' in selected_pred_name:
+                            bait_acc, prey_acc = selected_pred_name.split('_and_', 1)
+                            accs = [bait_acc.upper(), prey_acc.upper()]
+                        else:
+                            accs = [selected_pred_name.upper()]
+                        protein_names = []
+                        for i, cid in enumerate(chain_ids_resolved):
+                            if i < len(accs):
+                                acc = accs[i]
+                                protein_names.append(gene_cache.get(acc, acc))
+                            else:
+                                protein_names.append(cid)
+
+                    sample_dir = pred_dir / f"seed-{seed}_sample-{sample}"
+                    cif_file = sample_dir / f"{selected_pred_name}_seed-{seed}_sample-{sample}_model.cif"
+                    if not cif_file.exists():
+                        cif_file = sample_dir / "model.cif"
+                    if not cif_file.exists():
+                        cif_file = pred_dir / f"{selected_pred_name}_model.cif"
+                    if not cif_file.exists():
+                        cif_file = pred_dir / "model.cif"
+                    structure_file = cif_file
+                    structure_format = 'cif'
+                    if cif_file.exists():
+                        structure_content = cif_file.read_text()
+
+                    if confidences is not None and chain_ids_resolved and chain_lengths_resolved and cif_file.exists():
+                        pae_data = compute_interface_pae_per_residue(
+                            cif_file, confidences, chain_ids_resolved, chain_lengths_resolved
+                        )
+
+                if structure_content:
                     viewer_html = generate_viewer_html(
-                        cif_content,
+                        structure_content,
                         pae_residue_data=pae_data,
                         chain_names=protein_names,
                         chain_ids_all=chain_ids_resolved,
                         height=600,
+                        structure_format=structure_format,
                     )
 
                 # Store everything in session state
@@ -255,7 +319,8 @@ def show_detailed(project_path: str, af3_folder: str):
                 st.session_state['_detail_chain_ids'] = chain_ids_resolved
                 st.session_state['_detail_chain_lengths'] = chain_lengths_resolved
                 st.session_state['_detail_protein_names'] = protein_names
-                st.session_state['_detail_cif_file'] = str(cif_file)
+                st.session_state['_detail_cif_file'] = str(structure_file)
+                st.session_state['_detail_structure_format'] = structure_format
                 st.session_state['_detail_pae_data'] = pae_data
                 st.session_state['_detail_viewer_html'] = viewer_html
 
@@ -265,6 +330,7 @@ def show_detailed(project_path: str, af3_folder: str):
             chain_lengths_resolved = st.session_state.get('_detail_chain_lengths', [])
             protein_names = st.session_state.get('_detail_protein_names', ['Chain A', 'Chain B'])
             cif_file = Path(st.session_state.get('_detail_cif_file', ''))
+            structure_format = st.session_state.get('_detail_structure_format', 'cif')
             pae_data = st.session_state.get('_detail_pae_data')
             viewer_html = st.session_state.get('_detail_viewer_html')
 
@@ -277,7 +343,7 @@ def show_detailed(project_path: str, af3_folder: str):
                 if viewer_html:
                     components.html(viewer_html, height=620, scrolling=False)
                 else:
-                    st.warning(f"CIF file not found for seed-{seed}_sample-{sample}.")
+                    st.warning(f"Structure file not found for {model_label}.")
 
             with tab1:
                 st.markdown("### PAE Matrix Visualization")
@@ -335,14 +401,20 @@ def show_detailed(project_path: str, af3_folder: str):
                 st.markdown("### Interface Contacts")
 
                 from core.interface_analyzer import analyze_interface, map_interface_regions
+                from core.af2_detail import analyze_af2_interface
 
                 if cif_file.exists() and confidences is not None:
                     # Run interface analysis (cached in session state)
                     iface_key = f"_iface_{model_key}"
                     if iface_key not in st.session_state:
-                        st.session_state[iface_key] = analyze_interface(
-                            cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
-                        )
+                        if is_af2:
+                            st.session_state[iface_key] = analyze_af2_interface(
+                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
+                            )
+                        else:
+                            st.session_state[iface_key] = analyze_interface(
+                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
+                            )
                     interface_result = st.session_state[iface_key]
 
                     contacts = interface_result.get('contacts', [])
@@ -472,21 +544,32 @@ def show_detailed(project_path: str, af3_folder: str):
                     cache_key = (ss['seed'], ss['sample'])
                     cached = cached_models.get(cache_key, {})
 
-                    # Get per-model iPTM/PTM from summary or fall back to top-level
-                    model_summary = load_summary(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
-                    model_iptm = model_summary.get('iptm', 0) if model_summary else selected_pred['iptm']
-                    model_ptm = model_summary.get('ptm', 0) if model_summary else selected_pred['ptm']
-
-                    comparison_data.append({
-                        'Model': f"seed-{ss['seed']}_sample-{ss['sample']}",
-                        'iPTM': format_score(model_iptm),
-                        'PTM': format_score(model_ptm),
-                        'ipSAE': format_score(cached.get('ipsae')) if cached.get('ipsae') is not None else "-",
-                        'iPLDDT': format_score(cached.get('interface_plddt')) if cached.get('interface_plddt') is not None else "-",
-                        'PAE≤5': str(cached.get('contacts_pae5', '-')),
-                        'Ranking Score': format_score(ss['ranking_score']),
-                        'Top-ranked': "Yes" if is_top else "No"
-                    })
+                    if is_af2:
+                        # AF2 has no separate iPTM/PTM — only iPTM+pTM
+                        iptm_ptm_val = ss.get('iptm_ptm') or ss.get('ranking_score') or 0
+                        comparison_data.append({
+                            'Model': f"ranked_{ss['sample']}",
+                            'iPTM+pTM': format_score(iptm_ptm_val),
+                            'ipSAE': format_score(cached.get('ipsae')) if cached.get('ipsae') is not None else "-",
+                            'iPLDDT': format_score(cached.get('interface_plddt')) if cached.get('interface_plddt') is not None else "-",
+                            'PAE≤5': str(cached.get('contacts_pae5', '-')),
+                            'Top-ranked': "Yes" if is_top else "No",
+                        })
+                    else:
+                        # Get per-model iPTM/PTM from summary or fall back to top-level
+                        model_summary = load_summary(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
+                        model_iptm = model_summary.get('iptm', 0) if model_summary else selected_pred.get('iptm', 0)
+                        model_ptm = model_summary.get('ptm', 0) if model_summary else selected_pred.get('ptm', 0)
+                        comparison_data.append({
+                            'Model': f"seed-{ss['seed']}_sample-{ss['sample']}",
+                            'iPTM': format_score(model_iptm),
+                            'PTM': format_score(model_ptm),
+                            'ipSAE': format_score(cached.get('ipsae')) if cached.get('ipsae') is not None else "-",
+                            'iPLDDT': format_score(cached.get('interface_plddt')) if cached.get('interface_plddt') is not None else "-",
+                            'PAE≤5': str(cached.get('contacts_pae5', '-')),
+                            'Ranking Score': format_score(ss['ranking_score']),
+                            'Top-ranked': "Yes" if is_top else "No"
+                        })
 
                 comp_df = pd.DataFrame(comparison_data)
                 st.dataframe(comp_df, width='stretch')
@@ -498,13 +581,23 @@ def show_detailed(project_path: str, af3_folder: str):
                 if comp_plot_key not in st.session_state:
                     pae_matrices = []
                     model_labels = []
-                    for ss in seed_samples:
-                        is_top = ss['seed'] == selected_pred.get('seed') and ss['sample'] == selected_pred.get('sample')
-                        label = "Top" if is_top else f"s{ss['seed']}-m{ss['sample']}"
-                        conf = load_confidences(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
-                        if conf and conf.get('pae'):
-                            pae_matrices.append(np.array(conf['pae']))
-                            model_labels.append(label)
+                    if is_af2 and af2_work_dir is not None:
+                        from core.af2_detail import load_af2_model_data as _load_af2
+                        for ss in seed_samples:
+                            is_top_ss = ss['seed'] == top_seed and ss['sample'] == top_sample
+                            label = "Top" if is_top_ss else f"ranked_{ss['sample']}"
+                            bundle = _load_af2(af2_work_dir, ss['sample'])
+                            if bundle and bundle['confidences'].get('pae'):
+                                pae_matrices.append(np.array(bundle['confidences']['pae']))
+                                model_labels.append(label)
+                    else:
+                        for ss in seed_samples:
+                            is_top_ss = ss['seed'] == top_seed and ss['sample'] == top_sample
+                            label = "Top" if is_top_ss else f"s{ss['seed']}-m{ss['sample']}"
+                            conf = load_confidences(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
+                            if conf and conf.get('pae'):
+                                pae_matrices.append(np.array(conf['pae']))
+                                model_labels.append(label)
 
                     if pae_matrices:
                         import io
@@ -534,10 +627,16 @@ def show_detailed(project_path: str, af3_folder: str):
                     # Reuse interface analysis from tab2 (or compute if not yet done)
                     iface_key = f"_iface_{model_key}"
                     if iface_key not in st.session_state:
-                        from core.interface_analyzer import analyze_interface as _analyze_iface
-                        st.session_state[iface_key] = _analyze_iface(
-                            cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
-                        )
+                        if is_af2:
+                            from core.af2_detail import analyze_af2_interface as _analyze_iface_af2
+                            st.session_state[iface_key] = _analyze_iface_af2(
+                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
+                            )
+                        else:
+                            from core.interface_analyzer import analyze_interface as _analyze_iface
+                            st.session_state[iface_key] = _analyze_iface(
+                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
+                            )
                     iface_result = st.session_state[iface_key]
                     contacts_pymol = iface_result.get('contacts', []) if iface_result else None
 
@@ -610,6 +709,9 @@ def show_detailed(project_path: str, af3_folder: str):
                         iface_key = f"_iface_{model_key}"
                         if iface_key in st.session_state and st.session_state[iface_key]:
                             contacts = st.session_state[iface_key].get('contacts', [])
+                        elif is_af2:
+                            from core.af2_detail import analyze_af2_interface as _af2_iface
+                            contacts = _af2_iface(cif_file, confidences).get('contacts', [])
                         else:
                             from core.analyzer import calculate_interface_contacts
                             contacts = calculate_interface_contacts(cif_file, confidences)

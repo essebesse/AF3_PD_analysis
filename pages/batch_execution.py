@@ -29,12 +29,34 @@ def show_analyze(project_path: str, af3_folder: str):
         st.error(f"Predictions folder not found: {af3_folder}")
         return
 
-    # Count predictions
-    pred_count = len([d for d in os.listdir(af3_folder)
-                     if os.path.isdir(os.path.join(af3_folder, d))
-                     and not d.startswith('seed-') and not d.startswith('.')])
+    # Peek at the folder to figure out how many predictions (and of which
+    # format) live here. AF2 predictions are local-only, so if *any* AF2 is
+    # present we warn on the SLURM tab.
+    from core.scanner import AF3Scanner
+    from collections import Counter
+    predictions_meta = AF3Scanner(Path(af3_folder)).scan()
+    pred_count = len(predictions_meta)
+    format_counts = Counter(p.get('format', 'unknown') for p in predictions_meta)
+    formats_here = set(format_counts)
+    has_af2 = 'af2' in formats_here
 
-    st.info(f"Found {pred_count} predictions to analyze")
+    _fmt_label = {
+        'af3_local': 'AF3 local',
+        'af3_server_flat': 'AF3 Server',
+        'af2': 'AF2',
+        'unknown': 'unknown',
+    }
+    if len(format_counts) > 1:
+        breakdown = ", ".join(
+            f"{n} {_fmt_label.get(fmt, fmt)}"
+            for fmt, n in sorted(format_counts.items(), key=lambda kv: -kv[1])
+        )
+        st.info(f"Found **{pred_count}** predictions to analyze ({breakdown})")
+    elif format_counts:
+        only_fmt = next(iter(format_counts))
+        st.info(f"Found **{pred_count}** {_fmt_label.get(only_fmt, only_fmt)} predictions to analyze")
+    else:
+        st.info(f"Found **{pred_count}** predictions to analyze")
 
     # Show prominent notice when analysis cache already exists
     cache_file = Path(af3_folder) / "af3_app_all_models_analysis.json"
@@ -48,11 +70,19 @@ def show_analyze(project_path: str, af3_folder: str):
             cached_count = 0
         st.success(
             f"Results already available ({cached_count} models in cache). "
-            "You can go directly to Results, or re-analyze below if needed."
+            "Open them directly, or run a fresh analysis below "
+            "(useful if predictions were added or settings changed)."
         )
-        if st.button("Next: View Results →", type="primary"):
-            st.session_state['_navigate_to'] = "3. Results"
-            st.rerun()
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            if st.button("Next: View Results →", type="primary"):
+                st.session_state['_navigate_to'] = "3. Results"
+                st.rerun()
+        with col_b:
+            st.caption(
+                "↓ To re-analyze, use the **Local** or **SLURM** controls below. "
+                "Tick *Skip predictions already in cache* to only run new ones."
+            )
 
     st.divider()
 
@@ -62,7 +92,20 @@ def show_analyze(project_path: str, af3_folder: str):
         show_local_execution(project_path, af3_folder)
 
     with tab_slurm:
-        show_slurm_execution(project_path, af3_folder, pred_count)
+        if has_af2 and formats_here == {'af2'}:
+            st.info(
+                "**AF2 analysis is local-only for now.** The SLURM path is AF3-only. "
+                "Use the **Local** tab — AF2 analysis is fast enough that local "
+                "multiprocessing handles it comfortably."
+            )
+        else:
+            if has_af2:
+                st.warning(
+                    "This folder contains a mix of AF3 and AF2 predictions. "
+                    "The SLURM path will analyze the AF3 ones; run the AF2 "
+                    "subset on the **Local** tab."
+                )
+            show_slurm_execution(project_path, af3_folder, pred_count)
 
 
 def show_local_execution(project_path: str, af3_folder: str):
@@ -80,13 +123,32 @@ def show_local_execution(project_path: str, af3_folder: str):
         analyze_all = st.checkbox("Analyze all 5 models per prediction", value=False,
                                    help="Default: top-ranked model only. Check to analyze all seed/sample models.")
 
+        cache_file = Path(af3_folder) / "af3_app_all_models_analysis.json"
+        skip_cached = False
+        if cache_file.exists():
+            skip_cached = st.checkbox(
+                "Skip predictions already in cache",
+                value=False,
+                help=(
+                    "Analyze only predictions not yet in the cache — useful when "
+                    "new predictions were added to a folder that was already run. "
+                    "Leave unchecked if you changed the PAE cutoff or the all-models "
+                    "option, otherwise the cache will mix results from different settings."
+                ),
+            )
+
     st.divider()
 
-    # Execution button — label changes if results already exist
-    cache_file = Path(af3_folder) / "af3_app_all_models_analysis.json"
-    btn_label = "Re-analyze All Predictions" if cache_file.exists() else "Start Local Analysis"
+    # Execution button — label reflects what's about to happen
+    if skip_cached:
+        btn_label = "Analyze Missing Predictions"
+    elif cache_file.exists():
+        btn_label = "Re-analyze All Predictions"
+    else:
+        btn_label = "Start Local Analysis"
     if st.button(btn_label, type="primary"):
-        run_local_analysis(project_path, af3_folder, num_cpus, pae_cutoff, analyze_all)
+        run_local_analysis(project_path, af3_folder, num_cpus, pae_cutoff,
+                           analyze_all, skip_cached)
 
 
 def write_summary_txt(results: list, out_path: Path, pae_cutoff: float, analyze_all: bool,
@@ -182,7 +244,7 @@ def write_summary_txt(results: list, out_path: Path, pae_cutoff: float, analyze_
 
 
 def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cutoff: float,
-                       analyze_all: bool = True):
+                       analyze_all: bool = True, skip_cached: bool = False):
     """Run analysis locally with multiprocessing."""
 
     progress_bar = st.progress(0)
@@ -197,29 +259,54 @@ def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cu
         # Import analyzer
         from core.scanner import AF3Scanner, resolve_prediction_dir
         from core.analyzer import analyze_prediction_all_models
+        import json
 
         # Get all prediction directories (resolve AF3 Server nesting)
-        pred_dirs = []
+        all_pred_dirs = []
         for d in os.listdir(af3_folder):
             d_path = Path(af3_folder) / d
             if d_path.is_dir() and not d.startswith('seed-') and not d.startswith('.'):
-                pred_dirs.append(resolve_prediction_dir(d_path))
+                all_pred_dirs.append(resolve_prediction_dir(d_path))
+
+        if not all_pred_dirs:
+            st.warning("No prediction directories found.")
+            return
+
+        # Optionally filter out predictions that are already cached
+        cache_file = Path(af3_folder) / "af3_app_all_models_analysis.json"
+        cached_results = []
+        pred_dirs = all_pred_dirs
+        if skip_cached and cache_file.exists():
+            try:
+                with open(cache_file) as f:
+                    cached_results = json.load(f)
+                cached_names = {r.get('prediction_name') for r in cached_results if r.get('prediction_name')}
+                pred_dirs = [d for d in all_pred_dirs if d.name not in cached_names]
+                skipped = len(all_pred_dirs) - len(pred_dirs)
+                st.info(f"Skipping {skipped} predictions already in cache; {len(pred_dirs)} to analyze.")
+            except Exception as e:
+                st.warning(f"Could not read existing cache ({e}); running full analysis instead.")
+                cached_results = []
+                pred_dirs = all_pred_dirs
 
         total = len(pred_dirs)
-
         if total == 0:
-            st.warning("No prediction directories found.")
+            status_container.update(label="Nothing to do", state="complete")
+            st.success("All predictions are already in the cache. Go to **3. Results** to view them.")
             return
 
         status_text.text(f"Starting analysis with {num_cpus} CPUs on {total} predictions...")
 
-        # Collect all unique accessions from directory names
+        # Collect all unique accessions from AF3-style directory names
+        # (<acc>_and_<acc>). AF2 folders don't follow that convention — skip
+        # them to avoid polluting the UniProt lookup with bogus queries.
         from core.utils import fetch_gene_names_batch
 
         unique_accs = sorted({
             acc.upper()
-            for d in pred_dirs
-            for part in (d.name.split('_and_', 1) if '_and_' in d.name else [d.name])
+            for d in all_pred_dirs
+            if '_and_' in d.name
+            for part in d.name.split('_and_', 1)
             for acc in [part.upper()]
         })
 
@@ -256,20 +343,16 @@ def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cu
             # Worker pipe broke (e.g. Streamlit rerun) — use whatever results came in
             st.warning(f"Pool interrupted — saving {len(all_results)} models collected so far.")
 
-        results = all_results
-
-        # Strip sequences from results before saving (they're huge and already in data.json)
-        for r in results:
+        # Strip sequences from new results before saving (huge and already in data.json)
+        for r in all_results:
             if 'sequences' in r:
                 del r['sequences']
 
-        # Save per-prediction JSON files for fast lookup in detailed analysis
-        import json
+        # Per-prediction JSON files: only rewrite for predictions we just re-analyzed
         from collections import defaultdict
         by_pred = defaultdict(list)
-        for r in results:
+        for r in all_results:
             by_pred[r.get('prediction_name', '')].append(r)
-        # Build name -> resolved dir lookup
         pred_dir_map = {d.name: d for d in pred_dirs}
         for pred_name, entries in by_pred.items():
             if pred_name:
@@ -281,25 +364,25 @@ def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cu
                 except OSError as e:
                     st.warning(f"Could not save {pred_json.name}: {e}")
 
-        # Save combined results (big JSON)
-        cache_file = Path(af3_folder) / "af3_app_all_models_analysis.json"
+        # Merge freshly analyzed results with any untouched cached entries
+        results = cached_results + all_results
 
         with open(cache_file, 'w') as f:
             json.dump(results, f, indent=2)
 
-        # Fetch gene names via UniProt batch API with live progress
-        n_batches = max(1, (len(unique_accs) + 99) // 100)
-        status_text.text(f"Fetching gene names for {len(unique_accs)} proteins (0/{n_batches} batches)...")
-        progress_bar.progress(0.0)
-
+        # Fetch gene names via UniProt batch API with live progress (AF3 only)
         gene_cache = {}
+        if unique_accs:
+            n_batches = max(1, (len(unique_accs) + 99) // 100)
+            status_text.text(f"Fetching gene names for {len(unique_accs)} proteins (0/{n_batches} batches)...")
+            progress_bar.progress(0.0)
 
-        def _gene_progress(done, total):
-            batch_num = (done + 99) // 100
-            status_text.text(f"Fetching gene names: {done}/{total} proteins ({batch_num}/{n_batches} batches)...")
-            progress_bar.progress(min(done / total, 1.0))
+            def _gene_progress(done, total):
+                batch_num = (done + 99) // 100
+                status_text.text(f"Fetching gene names: {done}/{total} proteins ({batch_num}/{n_batches} batches)...")
+                progress_bar.progress(min(done / total, 1.0))
 
-        gene_cache = fetch_gene_names_batch(unique_accs, progress_callback=_gene_progress)
+            gene_cache = fetch_gene_names_batch(unique_accs, progress_callback=_gene_progress)
 
         # Push gene names into session_state cache for immediate use in tables
         st.session_state.setdefault('gene_name_cache', {}).update(gene_cache)
@@ -314,7 +397,14 @@ def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cu
 
         st.success(f"Results saved to {cache_file}")
         st.success(f"Summary written to {txt_file}")
-        st.success(f"Total models analyzed: {len(results)}")
+        if cached_results:
+            st.success(
+                f"Newly analyzed: {len(all_results)} models. "
+                f"Cache now contains {len(results)} models total "
+                f"({len(cached_results)} kept from previous run)."
+            )
+        else:
+            st.success(f"Total models analyzed: {len(results)}")
 
     except Exception as e:
         st.error(f"Analysis failed: {e}")

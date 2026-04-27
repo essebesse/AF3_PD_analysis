@@ -1,0 +1,211 @@
+Alpha Pulldown Analysis Web Application — Text for Scientific Publication
+=========================================================================
+
+RESULTS SECTION — Alpha Pulldown Analysis Web Application
+---------------------------------------------------------
+
+To systematically analyze the ~200,000 AlphaFold 3 pulldown predictions
+generated across H. sapiens, C. elegans, and C. reinhardtii ciliary
+proteomes — together with legacy AlphaFold 2 (ColabFold) predictions
+generated for individual interaction pairs — we developed an
+open-source web application (Alpha Pulldown Analysis App;
+https://github.com/essebesse/AF3_PD_analysis). The application is
+built on the Streamlit framework and provides an interactive,
+browser-based interface for loading, analyzing, and exploring AF2 and
+AF3 prediction data side by side. Three input layouts are auto-
+detected per-prediction: AlphaFold 3 local pipeline output (per-model
+mmCIF in seed-N_sample-M/ subfolders), AlphaFold 3 Server flat output
+(fold_*_model_N.cif files directly in the folder), and AlphaFold 2
+standard output (ranked_N.pdb plus per-model PAE and pLDDT CSV files
+together with ranking_debug.json).
+
+A key design principle of the application is to evaluate all five
+seed/sample (or ranked) models generated per prediction, rather than
+relying solely on the top-ranked model. This is motivated by the
+observation that ranking scores do not always correlate with interface
+quality, and that examining the full ensemble of models provides a
+more robust assessment of predicted interaction confidence. For each
+model, the application computes multiple complementary confidence
+metrics: the interface predicted TM-score (iPTM, AF3) or the combined
+iPTM+pTM ranking metric (AF2); the interface predicted structure
+accuracy estimator (ipSAE) as formulated by Wallner (2025), computed
+identically for AF2 and AF3 from the per-model PAE matrix;
+interface-local pLDDT restricted to spatially validated interface
+residues; and the number of inter-chain contacts passing combined PAE
+and Cbeta-Cbeta distance filters at multiple thresholds (PAE < 3, 5,
+and 8 A; Cbeta-Cbeta < 8 A). Pairwise interface scoring is enforced:
+predictions with three or more chains are still rendered in 3D but
+their metrics are computed only between the first two chains, and the
+interface is flagged accordingly.
+
+The application implements a four-step workflow: (1) Load Data —
+automatic recursive scanning of prediction directories with format
+auto-detection and gene name annotation via the UniProt REST API for
+AF3 outputs; (2) Analyze — batch computation of confidence metrics
+using local Python multiprocessing (AF2 and AF3) or SLURM cluster
+submission for large-scale AF3 datasets; (3) Results — sortable,
+filterable result tables with CSV and XLSX export; and (4) Detailed
+Analysis — per-prediction deep dives including PAE matrix
+visualization, interface contact classification (hydrophobic, hydrogen
+bond, salt bridge, aromatic, and polar interactions), hub residue
+identification, interactive 3D structure viewing via 3Dmol.js (CIF for
+AF3, PDB for AF2; library bundled inline for fully offline operation),
+and PyMOL script generation for publication-quality figures.
+Confidence tiers (High, Medium, Low, Very Low) are assigned based on
+ipSAE thresholds following the classification scheme of Wallner
+(2025): High (ipSAE > 0.7), Medium (0.5-0.7), Low (0.3-0.5), and Very
+Low (< 0.3). Using ipSAE as the unified tier metric provides
+consistent confidence categories across both AF2 and AF3 outputs.
+
+
+MATERIALS AND METHODS
+---------------------
+
+AlphaFold Pulldown Screens
+
+To systematically predict binary protein-protein interactions among
+ciliary proteins, we performed an AlphaFold 3 pulldown (AF3-PD) screen
+together with targeted AlphaFold 2 (ColabFold) follow-ups for selected
+candidates. Ciliary proteomes were compiled for three organisms: Homo
+sapiens, Caenorhabditis elegans, and Chlamydomonas reinhardtii. For
+each organism, all pairwise combinations of bait and prey proteins
+were submitted as binary complexes to AlphaFold 3 (Abramson et al.,
+2024). Each prediction was run with 5 seed/sample models (seeds 0-4),
+yielding a total of approximately 200,000 individual structure
+predictions across all three organisms. Selected interactions were
+additionally predicted with AlphaFold 2 / ColabFold (Mirdita et al.,
+2022), yielding 5 ranked models per prediction (ranked_0..4).
+
+AF3 output for each prediction pair consisted of five model structures
+in mmCIF format, along with per-model confidence metrics
+(summary_confidences.json, confidences.json containing full predicted
+aligned error (PAE) matrices and per-atom pLDDT values) and ranking
+scores. AF2 output for each prediction consisted of five PDB
+structures (ranked_N.pdb), per-model PAE matrices in CSV form, per-
+residue pLDDT in CSV form, and a ranking_debug.json file giving the
+combined iPTM+pTM scores and ranked ordering of the models.
+
+
+Confidence Metric Computation
+
+All five models per prediction were analyzed rather than restricting
+evaluation to the top-ranked model. The following confidence metrics
+were computed for each model:
+
+iPTM and iPTM+pTM: For AF3 predictions the interface predicted
+TM-score (iPTM) and the predicted TM-score (PTM) are reported
+separately by AlphaFold 3 in the per-model summary confidence files.
+For AF2 predictions ColabFold reports only the combined iPTM+pTM
+ranking metric in ranking_debug.json (defined as 0.8 * iPTM + 0.2 *
+PTM in the AF2 ranking convention); this combined value is used as
+the AF2 ranking score in the application.
+
+ipSAE (interface predicted structure accuracy estimator): Calculated
+following the formulation of Wallner (2025), adapted from the TM-score
+framework, and computed identically for AF2 and AF3 predictions since
+the formula depends only on the PAE matrix and chain assignments. For
+a given alignment direction (chain A aligned on chain B), the
+per-residue ipSAE score was computed as:
+
+    ipSAE_i = (1/L) * sum_j [ 1 / (1 + (d_ij / d_0)^2) ]
+
+where d_ij are PAE values below a cutoff threshold (default 10 A), L
+is the number of residues passing the cutoff, and d_0 = 1.24*(L-15)^
+(1/3) - 1.8 for L >= 27 (otherwise d_0 = 1.0). The asymmetric score
+was taken as the maximum per-residue value across the aligned chain,
+and the final symmetric ipSAE was defined as:
+
+    ipSAE(A,B) = max[ ipSAE(A -> B), ipSAE(B -> A) ]
+
+Interface contacts: Inter-chain residue pairs were identified using a
+dual-filter approach requiring both (i) a PAE value below threshold
+and (ii) a Cbeta-Cbeta distance (Calpha for glycine) below 8 A.
+Contacts were counted at three PAE thresholds (3, 5, and 8 A) to
+provide graded stringency levels. The same contact definition was
+applied to AF2 and AF3 predictions; the only differences are the
+underlying file formats (mmCIF for AF3, PDB for AF2; structures
+parsed via gemmi).
+
+Interface pLDDT: The mean pLDDT was calculated exclusively over
+spatially validated interface residues (those participating in
+inter-chain contacts with PAE <= 6 A and Cbeta-Cbeta distance <= 8 A),
+providing a local confidence estimate specific to the predicted
+interface rather than the full structure. For AF3 the per-atom
+atom_plddts array was used; for AF2 the per-residue pLDDT from
+ranked_N_pLDDT.csv was used.
+
+Confidence tier classification: Predictions were categorized into
+confidence tiers based on ipSAE: High (> 0.7), Medium (0.5-0.7), Low
+(0.3-0.5), and Very Low (< 0.3), following the thresholds proposed by
+Wallner (2025). Using ipSAE as the unified tier metric ensures
+identical confidence categories across AF2 and AF3 outputs and
+sidesteps the differences in their native ranking scores.
+
+Pairwise-only enforcement: For predictions involving three or more
+chains, interface metrics were restricted to chains A and B (the
+first two chains in mmCIF / PDB chain order). This pairwise
+restriction reflects the AF3-PD screen design (binary bait-prey
+queries) and is applied uniformly to AF2 and AF3 predictions,
+including in the 3D viewer where the full multi-chain structure is
+still displayed.
+
+
+Interface Contact Analysis
+
+For detailed interface characterization, contacts were classified by
+chemical interaction type based on residue identity: salt bridges
+(oppositely charged residue pairs R/K/H with D/E, Cbeta-Cbeta < 5.5
+A), hydrogen bonds (residues with H-bond capable sidechains
+S/T/N/Q/Y/C/D/E/R/K/H/W, Cbeta-Cbeta < 5.0 A), aromatic interactions
+(F/Y/W/H pairs, Cbeta-Cbeta < 5.5 A), hydrophobic contacts (nonpolar
+residue pairs A/V/L/I/M/F/W/P/G, Cbeta-Cbeta < 5.0 A), and polar
+contacts (all remaining pairs, Cbeta-Cbeta < 5.0 A). Hub residues
+were defined as interface residues making three or more inter-chain
+contacts.
+
+
+Alpha Pulldown Analysis Web Application
+
+Analysis was performed using a custom Streamlit web application
+(Alpha Pulldown Analysis App, v1.1) developed for this study. The
+application provides an interactive browser-based interface for
+loading AlphaFold 2 and AlphaFold 3 prediction directories with
+automatic format detection (AF3 local pipeline, AF3 Server flat, AF2
+standard with optional seq/ subdirectory layout), computing the
+confidence metrics described above via local multiprocessing (AF2 and
+AF3) or SLURM cluster job submission (AF3), and exploring results
+through sortable tables, PAE matrix visualizations, interactive 3D
+structure viewers (3Dmol.js, bundled inline so that the viewer
+operates fully offline on air-gapped or HPC networks), and PyMOL
+script generation. AF3 mmCIF files are parsed with a custom mmCIF
+parser; AF2 PDB files are parsed with gemmi. Hydrogens are stripped
+from AF2 PDB content before transfer to the in-browser 3D viewer to
+keep iframe payloads compact. Gene name annotations were retrieved
+from the UniProt REST API for AF3 predictions following the
+<bait_accession>_and_<prey_accession> folder-name convention. The
+application is open source and available at
+https://github.com/essebesse/AF3_PD_analysis under the MIT license.
+
+
+Computational Resources
+
+Batch analysis of the ~200,000 AF3 predictions was performed on
+[CLUSTER NAME] using SLURM job scheduling. Predictions were
+distributed across parallel jobs, with each job analyzing a subset of
+predictions using Python multiprocessing. Numerical computations used
+NumPy; structure parsing used a custom mmCIF reader (AF3) and gemmi
+(AF2). Analysis results were cached as JSON files for rapid
+re-loading during interactive exploration. AF2 analyses were run
+locally with multiprocessing on the application host.
+
+
+KEY REFERENCES
+--------------
+- AlphaFold 3: Abramson et al., Nature 2024
+- AlphaFold 2 / ColabFold: Jumper et al., Nature 2021; Mirdita et al.,
+  Nat. Methods 2022
+- ipSAE formulation / confidence thresholds: Wallner, Bioinformatics
+  2025 (verify exact reference — code references "Dunbrack 2025")
+- gemmi (PDB/mmCIF parsing): Wojdyr, JOSS 2022
+
+NOTE: Replace [CLUSTER NAME] with your HPC system name.

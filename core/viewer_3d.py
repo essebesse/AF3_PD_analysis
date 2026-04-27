@@ -1,12 +1,15 @@
 """
-3D structure viewer for Streamlit using 3Dmol.js (served as static file).
+3D structure viewer for Streamlit using 3Dmol.js.
 
 Embeds an interactive 3D viewer via st.components.v1.html() with
 PAE-based interface coloring. Interface residues are identified using both
 inter-chain PAE and spatial proximity.
 
-3Dmol.js is loaded from CDN (jsdelivr),
-keeping the HTML small (~5KB + CIF) for fast model switching.
+3Dmol.js is bundled inline from ./static/3Dmol-min.js into each iframe.
+Streamlit's static file server returns the file with Content-Type: text/plain
+plus X-Content-Type-Options: nosniff, which causes browsers to refuse to
+execute it as JavaScript. Inlining sidesteps that, keeps the viewer working
+on air-gapped/HPC networks, and the JS source is read once per Python process.
 """
 
 import json as _json
@@ -14,6 +17,19 @@ import numpy as np
 import gemmi
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def _threedmol_js_source() -> str:
+    """Read static/3Dmol-min.js once per process. Returns empty string if the
+    file is missing — the viewer template renders a clear fallback in that
+    case rather than a silent failure."""
+    js_path = Path(__file__).resolve().parent.parent / "static" / "3Dmol-min.js"
+    try:
+        return js_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def compute_interface_pae_per_residue(
@@ -157,12 +173,18 @@ def generate_viewer_html(
     chain_names: Optional[List[str]] = None,
     chain_ids_all: Optional[List[str]] = None,
     height: int = 600,
+    structure_format: str = "cif",
 ) -> str:
     """
     Generate HTML with 3Dmol.js viewer.
 
-    3Dmol.js is loaded from Streamlit static file server (not inline).
+    3Dmol.js is loaded from Streamlit's static file server at
+    /app/static/3Dmol-min.js (no CDN, works offline).
     PAE interface coloring is always applied when data is available.
+
+    structure_format: "cif" (AF3) or "pdb" (AF2). Tells 3Dmol's addModel which
+    parser to use. The cif_content parameter name is kept for backwards-
+    compatibility — pass PDB text when structure_format="pdb".
     """
     all_chains = chain_ids_all or (list(pae_residue_data.keys()) if pae_residue_data else [])
 
@@ -255,6 +277,22 @@ def generate_viewer_html(
         No confident interface residues detected (PAE &lt; 12 &#197; + distance &lt; 8 &#197;)
     </div>'''
 
+    threedmol_src = _threedmol_js_source()
+    if not threedmol_src:
+        # File missing — show a clear message without trying to load the viewer
+        return f'''<!DOCTYPE html>
+<html><body>
+<div style="padding:40px;text-align:center;color:#b91c1c;font-family:Arial,sans-serif;">
+    3Dmol.js source not found at <code>static/3Dmol-min.js</code>.<br>
+    Run <code>./run.sh</code> from the app directory so the bundled file is found,
+    or place a copy of <code>3Dmol-min.js</code> there.
+</div>
+</body></html>'''
+
+    # The bundled JS is large; injecting it via a Script element with
+    # textContent avoids any HTML re-parsing of its contents.
+    threedmol_json = _json.dumps(threedmol_src)
+
     html = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -264,23 +302,40 @@ def generate_viewer_html(
 <div id="container" style="width:100%;height:{height}px;position:relative;">
     <div id="viewer" style="width:100%;height:100%;">
         <div id="viewer_fallback" style="padding:40px;text-align:center;color:#b91c1c;font-family:Arial,sans-serif;">
-            3Dmol.js failed to load.<br>
-            This usually means you are on an isolated network without CDN access.<br>
-            The PAE plots and other analysis tabs still work.
+            3D viewer initializing… if this message persists, the bundled
+            3Dmol.js failed to evaluate. Check the browser console.
         </div>
     </div>
     {legend_html}
     {no_iface_msg}
 </div>
-<script src="https://cdn.jsdelivr.net/npm/3dmol@2.5.4/build/3Dmol-min.js"></script>
+<script>
+    // Inject 3Dmol.js inline (Streamlit static serving returns text/plain
+    // which browsers refuse to execute as JS due to nosniff)
+    (function() {{
+        var s = document.createElement("script");
+        s.text = {threedmol_json};
+        document.head.appendChild(s);
+    }})();
+</script>
 <script>
     if (typeof $3Dmol !== "undefined") {{
         document.getElementById("viewer_fallback").remove();
-        var viewer = $3Dmol.createViewer("viewer", {{backgroundColor: "white"}});
-        viewer.addModel({cif_escaped}, "cif");
+        try {{
+            var viewer = $3Dmol.createViewer("viewer", {{backgroundColor: "white"}});
+            viewer.addModel({cif_escaped}, "{structure_format}");
 {style_js}
-        viewer.zoomTo();
-        viewer.render();
+            viewer.zoomTo();
+            viewer.render();
+        }} catch (e) {{
+            var msg = document.createElement("div");
+            msg.style.cssText = "padding:40px;text-align:center;color:#b91c1c;font-family:Arial,sans-serif;";
+            msg.innerHTML = "3D viewer failed to render structure.<br><code>" +
+                            (e && e.message ? e.message : String(e)) + "</code>";
+            var v = document.getElementById("viewer");
+            if (v) {{ v.innerHTML = ""; v.appendChild(msg); }}
+            console.error("3Dmol render error:", e);
+        }}
     }}
 </script>
 </body>
