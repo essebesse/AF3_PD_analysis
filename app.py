@@ -68,6 +68,8 @@ else:
         value=project_path_current,
         placeholder="/path/to/your/project  (folder with AF3 prediction subdirectories)",
     )
+    if typed_path:
+        typed_path = os.path.expanduser(typed_path)
     if typed_path and os.path.isdir(typed_path):
         st.session_state['project_path'] = typed_path
         st.rerun()
@@ -157,6 +159,37 @@ af3_folder = find_predictions_folder(project_path)
 if not af3_folder:
     st.error(f"Folder not found: {project_path}")
     st.stop()
+
+# Project folder changed since last render — wipe folder-scoped session state
+# so we don't carry forward stale SLURM job IDs, selected predictions, or
+# cached PAE/iface/viewer entries from the previous folder.
+if st.session_state.get('_active_project') != project_path:
+    folder_scoped_keys = {
+        'selected_prediction', 'slurm_job_ids', 'slurm_num_chunks',
+        '_slurm_merge_attempted_for',
+    }
+    folder_scoped_prefixes = (
+        '_detail_', '_pae_plot_', '_zoom_plot_', '_iface_', '_comp_plot_',
+    )
+    for k in list(st.session_state.keys()):
+        if k in folder_scoped_keys or k.startswith(folder_scoped_prefixes):
+            del st.session_state[k]
+    # Drop any st.cache_data caches keyed by the old folder (per-folder
+    # scanners cache by path arg, so old entries are inert, but clearing
+    # also gets rid of the legacy cache reads).
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    st.session_state['_active_project'] = project_path
+
+# If a SLURM run finished while the user was on any other workflow step
+# (Results, Detailed Analysis, Load Data), merge it now so they see fresh
+# data the moment they navigate. The merge runs at top level so it fires
+# regardless of which step is currently selected.
+from pages.batch_execution import _auto_merge_if_needed as _auto_merge
+if _auto_merge(af3_folder):
+    st.rerun()
 
 # Sidebar: app info
 with st.sidebar:

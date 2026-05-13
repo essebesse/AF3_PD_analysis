@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.scanner import AF3Scanner, load_prediction_data
-from core.utils import format_score
+from core.utils import format_score, split_prediction_name
 
 
 def show_detailed(project_path: str, af3_folder: str):
@@ -67,12 +67,11 @@ def show_detailed(project_path: str, af3_folder: str):
                 filtered_names.append(name)
                 continue
             # Match against gene names from cache
-            if '_and_' in name:
-                bait, prey = name.split('_and_', 1)
-                bait_gene = gene_cache.get(bait.upper(), '').lower()
-                prey_gene = gene_cache.get(prey.upper(), '').lower()
-                if q in bait_gene or q in prey_gene:
-                    filtered_names.append(name)
+            bait_acc, prey_acc = split_prediction_name(name)
+            bait_gene = gene_cache.get(bait_acc, '').lower()
+            prey_gene = gene_cache.get(prey_acc, '').lower()
+            if q in bait_gene or q in prey_gene:
+                filtered_names.append(name)
         if filtered_names:
             pred_names = filtered_names
         else:
@@ -91,14 +90,14 @@ def show_detailed(project_path: str, af3_folder: str):
 
         # Build display labels with gene names
         def _label(name):
-            if '_and_' in name:
-                bait, prey = name.split('_and_', 1)
-                bg = gene_cache.get(bait.upper(), '')
-                pg = gene_cache.get(prey.upper(), '')
+            bait_acc, prey_acc = split_prediction_name(name)
+            if prey_acc:
+                bg = gene_cache.get(bait_acc, '')
+                pg = gene_cache.get(prey_acc, '')
                 if bg and pg:
                     return f"{bg} × {pg}  ({name})"
                 elif bg:
-                    return f"{bg} × {prey.upper()}  ({name})"
+                    return f"{bg} × {prey_acc}  ({name})"
             return name
 
         display_labels = [_label(n) for n in pred_names]
@@ -129,6 +128,18 @@ def show_detailed(project_path: str, af3_folder: str):
 
     if not selected_pred:
         return
+
+    # Format-specific notice — AlphaPulldown / AF2-multimer has no PAE matrix,
+    # so PAE plots, ipSAE, and PAE-filtered contacts are not available.
+    if selected_pred.get('format') == 'alphapulldown':
+        st.warning(
+            "**AlphaPulldown / AF2-multimer prediction.** "
+            "Detailed PAE analysis is not available for this format — AF2-multimer "
+            "output does not include the per-residue PAE matrix. "
+            "Available: 3D structure (PDB), spatial Cβ–Cβ interface contacts, "
+            "interface pLDDT (from B-factors), hub residues, and PyMOL/contacts export. "
+            "Not available: ipSAE, PAE plots, PAE-filtered contacts, PAE matrix export."
+        )
 
     st.divider()
 
@@ -189,14 +200,22 @@ def show_detailed(project_path: str, af3_folder: str):
             # ── Compute everything ONCE per model, store in session state ──
             model_key = f"{selected_pred_name}_{seed}_{sample}"
             if st.session_state.get('_detail_model_key') != model_key:
-                # Model changed — clear old cached plots/data
+                # Model changed — drop old cached plots/data by exact key,
+                # not substring (which would cross-clear predictions whose
+                # names share a prefix).
                 old_key = st.session_state.get('_detail_model_key', '')
                 old_pred = old_key.rsplit('_', 2)[0] if old_key else ''
-                for k in list(st.session_state.keys()):
-                    if old_key and k.startswith(('_pae_plot_', '_zoom_plot_', '_iface_')) and old_key in k:
-                        del st.session_state[k]
-                    elif old_pred and k.startswith('_comp_plot_') and old_pred in k:
-                        del st.session_state[k]
+                to_drop = []
+                if old_key:
+                    to_drop.extend([
+                        f'_pae_plot_{old_key}',
+                        f'_zoom_plot_{old_key}',
+                        f'_iface_{old_key}',
+                    ])
+                if old_pred:
+                    to_drop.append(f'_comp_plot_{old_pred}')
+                for k in to_drop:
+                    st.session_state.pop(k, None)
 
                 # Recompute all derived data
                 confidences = load_confidences(pred_dir, selected_pred_name, seed, sample)
@@ -204,13 +223,30 @@ def show_detailed(project_path: str, af3_folder: str):
                 chain_ids_resolved = []
                 chain_lengths_resolved = []
                 protein_names = ['Chain A', 'Chain B']
+                pred_format = selected_pred.get('format', 'af3')
+
                 if confidences is not None:
                     chain_ids_resolved, chain_lengths_resolved = get_chain_info_from_confidences(confidences)
-                    if '_and_' in selected_pred_name:
-                        bait_acc, prey_acc = selected_pred_name.split('_and_', 1)
-                        accs = [bait_acc.upper(), prey_acc.upper()]
-                    else:
-                        accs = [selected_pred_name.upper()]
+                elif pred_format == 'alphapulldown':
+                    # No PAE/confidences — derive chain info from the PDB itself.
+                    try:
+                        import gemmi as _gemmi
+                        _structure = _gemmi.read_structure(str(
+                            pred_dir / f"ranked_{sample}.pdb"
+                        ))
+                        if len(_structure) > 0:
+                            _model = _structure[0]
+                            for _ch in _model:
+                                _residues = [r for r in _ch]
+                                if _residues:
+                                    chain_ids_resolved.append(_ch.name)
+                                    chain_lengths_resolved.append(len(_residues))
+                    except Exception:
+                        pass
+
+                if chain_ids_resolved:
+                    bait_acc, prey_acc = split_prediction_name(selected_pred_name)
+                    accs = [bait_acc, prey_acc] if prey_acc else [bait_acc]
                     protein_names = []
                     for i, cid in enumerate(chain_ids_resolved):
                         if i < len(accs):
@@ -220,15 +256,19 @@ def show_detailed(project_path: str, af3_folder: str):
                         else:
                             protein_names.append(cid)
 
-                # Find CIF file
+                # Find structure file — local-pipeline CIF, AF3 Server flat,
+                # or AlphaPulldown (AF2-multimer) PDB
                 sample_dir = pred_dir / f"seed-{seed}_sample-{sample}"
-                cif_file = sample_dir / f"{selected_pred_name}_seed-{seed}_sample-{sample}_model.cif"
-                if not cif_file.exists():
-                    cif_file = sample_dir / "model.cif"
-                if not cif_file.exists():
-                    cif_file = pred_dir / f"{selected_pred_name}_model.cif"
-                if not cif_file.exists():
-                    cif_file = pred_dir / "model.cif"
+                cif_candidates = [
+                    sample_dir / f"{selected_pred_name}_seed-{seed}_sample-{sample}_model.cif",
+                    sample_dir / "model.cif",
+                    pred_dir / f"{selected_pred_name}_model_{sample}.cif",  # AF3 Server flat
+                    pred_dir / f"ranked_{sample}.pdb",                       # AlphaPulldown
+                    pred_dir / f"{selected_pred_name}_model.cif",
+                    pred_dir / "model.cif",
+                ]
+                cif_file = next((p for p in cif_candidates if p.exists()),
+                                cif_candidates[0])
 
                 # Compute interface PAE (uses confidences already in memory — no re-read)
                 pae_data = None
@@ -241,12 +281,14 @@ def show_detailed(project_path: str, af3_folder: str):
                 viewer_html = None
                 if cif_file.exists():
                     cif_content = cif_file.read_text()
+                    model_format = "pdb" if cif_file.suffix.lower() == ".pdb" else "cif"
                     viewer_html = generate_viewer_html(
                         cif_content,
                         pae_residue_data=pae_data,
                         chain_names=protein_names,
                         chain_ids_all=chain_ids_resolved,
                         height=600,
+                        model_format=model_format,
                     )
 
                 # Store everything in session state
@@ -282,7 +324,14 @@ def show_detailed(project_path: str, af3_folder: str):
             with tab1:
                 st.markdown("### PAE Matrix Visualization")
 
-                if confidences is not None:
+                if confidences is None and selected_pred.get('format') == 'alphapulldown':
+                    st.info(
+                        "**Not available for AlphaPulldown (AF2-multimer) output.** "
+                        "AF2-multimer predictions only include the rendered PAE PNGs that "
+                        "AlphaPulldown writes alongside `ranked_*.pdb` — there is no PAE "
+                        "matrix to plot interactively in this workflow."
+                    )
+                elif confidences is not None:
                     pae_matrix = np.array(confidences.get('pae', []))
 
                     if pae_matrix.size > 0:
@@ -334,15 +383,30 @@ def show_detailed(project_path: str, af3_folder: str):
             with tab2:
                 st.markdown("### Interface Contacts")
 
-                from core.interface_analyzer import analyze_interface, map_interface_regions
+                from core.interface_analyzer import (
+                    analyze_interface, analyze_interface_spatial, map_interface_regions,
+                )
 
-                if cif_file.exists() and confidences is not None:
-                    # Run interface analysis (cached in session state)
+                _is_ap = selected_pred.get('format') == 'alphapulldown'
+                _can_full = cif_file.exists() and confidences is not None
+                _can_spatial = cif_file.exists() and _is_ap
+
+                if _is_ap and _can_spatial:
+                    st.caption(
+                        "AF2-multimer: spatial Cβ–Cβ contacts only (no PAE filter)."
+                    )
+
+                if _can_full or _can_spatial:
                     iface_key = f"_iface_{model_key}"
                     if iface_key not in st.session_state:
-                        st.session_state[iface_key] = analyze_interface(
-                            cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
-                        )
+                        if _can_full:
+                            st.session_state[iface_key] = analyze_interface(
+                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
+                            )
+                        else:
+                            st.session_state[iface_key] = analyze_interface_spatial(
+                                cif_file, distance_cutoff=8.0
+                            )
                     interface_result = st.session_state[iface_key]
 
                     contacts = interface_result.get('contacts', [])
@@ -352,14 +416,29 @@ def show_detailed(project_path: str, af3_folder: str):
                     hub_residues_b = interface_result.get('hub_residues_b', [])
 
                     if contacts:
-                        st.success(f"Found {len(contacts)} interface contacts (PAE≤10Å, Cβ≤8Å)")
+                        if _is_ap:
+                            st.success(f"Found {len(contacts)} interface contacts (Cβ≤8Å, no PAE filter)")
+                        else:
+                            st.success(f"Found {len(contacts)} interface contacts (PAE≤10Å, Cβ≤8Å)")
 
-                        # Show summary metrics
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("Total Contacts", summary.get('total_contacts', 0))
-                        col2.metric("Mean PAE", f"{summary.get('mean_pae', 0):.2f} Å")
-                        col3.metric("Mean Distance", f"{summary.get('mean_distance', 0):.2f} Å")
-                        col4.metric("Interface Area", f"{summary.get('interface_area_estimate', 0)} residues")
+                        # Show summary metrics — Mean PAE is unavailable for AlphaPulldown
+                        mean_pae = summary.get('mean_pae')
+                        mean_dist = summary.get('mean_distance')
+                        if mean_pae is None:
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("Total Contacts", summary.get('total_contacts', 0))
+                            col2.metric("Mean Distance",
+                                        f"{mean_dist:.2f} Å" if mean_dist is not None else "—")
+                            col3.metric("Interface Area",
+                                        f"{summary.get('interface_area_estimate', 0)} residues")
+                        else:
+                            col1, col2, col3, col4 = st.columns(4)
+                            col1.metric("Total Contacts", summary.get('total_contacts', 0))
+                            col2.metric("Mean PAE", f"{mean_pae:.2f} Å")
+                            col3.metric("Mean Distance",
+                                        f"{mean_dist:.2f} Å" if mean_dist is not None else "—")
+                            col4.metric("Interface Area",
+                                        f"{summary.get('interface_area_estimate', 0)} residues")
 
                         # Show chemical interaction breakdown
                         st.subheader("Chemical Interaction Types")
@@ -425,7 +504,10 @@ def show_detailed(project_path: str, af3_folder: str):
                     else:
                         st.warning("No interface contacts found.")
                 else:
-                    st.warning("Required files not found. Run full analysis first.")
+                    if _is_ap:
+                        st.warning("Structure file (ranked_*.pdb) not found for this model.")
+                    else:
+                        st.warning("Required files not found. Run full analysis first.")
 
             with tab3:
                 st.markdown("### All Models Comparison")
@@ -472,10 +554,15 @@ def show_detailed(project_path: str, af3_folder: str):
                     cache_key = (ss['seed'], ss['sample'])
                     cached = cached_models.get(cache_key, {})
 
-                    # Get per-model iPTM/PTM from summary or fall back to top-level
-                    model_summary = load_summary(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
-                    model_iptm = model_summary.get('iptm', 0) if model_summary else selected_pred['iptm']
-                    model_ptm = model_summary.get('ptm', 0) if model_summary else selected_pred['ptm']
+                    # Per-model iPTM/PTM. AlphaPulldown stores combined iptm+ptm
+                    # directly on seed_samples; AF3 needs load_summary.
+                    if ss.get('iptm') is not None and selected_pred.get('format') == 'alphapulldown':
+                        model_iptm = ss['iptm']
+                        model_ptm = ss.get('ptm', model_iptm)
+                    else:
+                        model_summary = load_summary(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
+                        model_iptm = model_summary.get('iptm', 0) if model_summary else selected_pred['iptm']
+                        model_ptm = model_summary.get('ptm', 0) if model_summary else selected_pred['ptm']
 
                     comparison_data.append({
                         'Model': f"seed-{ss['seed']}_sample-{ss['sample']}",
@@ -491,15 +578,20 @@ def show_detailed(project_path: str, af3_folder: str):
                 comp_df = pd.DataFrame(comparison_data)
                 st.dataframe(comp_df, width='stretch')
 
-                # Load PAE matrices for all models and show side-by-side comparison
-                st.subheader("PAE Matrix Comparison")
+                # Side-by-side PAE matrix comparison — AF3 only
+                _show_pae_comparison = selected_pred.get('format') != 'alphapulldown'
+                if not _show_pae_comparison:
+                    st.caption(
+                        "PAE matrix side-by-side comparison is not available for "
+                        "AlphaPulldown (AF2-multimer) — no PAE matrix in this output."
+                    )
 
                 comp_plot_key = f"_comp_plot_{selected_pred_name}"
-                if comp_plot_key not in st.session_state:
+                if _show_pae_comparison and comp_plot_key not in st.session_state:
                     pae_matrices = []
                     model_labels = []
                     for ss in seed_samples:
-                        is_top = ss['seed'] == selected_pred.get('seed') and ss['sample'] == selected_pred.get('sample')
+                        is_top = ss['seed'] == top_seed and ss['sample'] == top_sample
                         label = "Top" if is_top else f"s{ss['seed']}-m{ss['sample']}"
                         conf = load_confidences(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
                         if conf and conf.get('pae'):
@@ -516,10 +608,11 @@ def show_detailed(project_path: str, af3_folder: str):
                     else:
                         st.session_state[comp_plot_key] = None
 
-                if st.session_state[comp_plot_key]:
-                    st.image(st.session_state[comp_plot_key])
-                else:
-                    st.warning("Could not load PAE matrices for comparison.")
+                if _show_pae_comparison:
+                    if st.session_state.get(comp_plot_key):
+                        st.image(st.session_state[comp_plot_key])
+                    else:
+                        st.warning("Could not load PAE matrices for comparison.")
 
             with tab5:
                 st.markdown("### PyMOL Visualization Scripts")
@@ -527,17 +620,23 @@ def show_detailed(project_path: str, af3_folder: str):
 
                 from core.pymol_script import generate_pymol_script
 
-                if cif_file.exists() and confidences is not None and len(chain_ids_resolved) >= 2:
-                    # Reuse PAE data and contacts from session state (already computed)
+                if cif_file.exists() and len(chain_ids_resolved) >= 2:
+                    # Reuse PAE data (None for AlphaPulldown — no PAE tiers in script)
                     pae_data_pymol = pae_data
 
-                    # Reuse interface analysis from tab2 (or compute if not yet done)
+                    # Reuse interface analysis from tab2 (compute spatially if AP)
                     iface_key = f"_iface_{model_key}"
                     if iface_key not in st.session_state:
-                        from core.interface_analyzer import analyze_interface as _analyze_iface
-                        st.session_state[iface_key] = _analyze_iface(
-                            cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
-                        )
+                        if confidences is not None:
+                            from core.interface_analyzer import analyze_interface as _analyze_iface
+                            st.session_state[iface_key] = _analyze_iface(
+                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
+                            )
+                        else:
+                            from core.interface_analyzer import analyze_interface_spatial as _analyze_iface_spatial
+                            st.session_state[iface_key] = _analyze_iface_spatial(
+                                cif_file, distance_cutoff=8.0
+                            )
                     iface_result = st.session_state[iface_key]
                     contacts_pymol = iface_result.get('contacts', []) if iface_result else None
 
@@ -583,7 +682,7 @@ def show_detailed(project_path: str, af3_folder: str):
 - Light blue / light orange: non-interface chain coloring
 """)
                 else:
-                    st.warning("CIF file and confidences required for PyMOL script generation.")
+                    st.warning("Structure file and at least two chains required for PyMOL script generation.")
 
             with tab4:
                 st.markdown("### Export Options")
@@ -604,26 +703,30 @@ def show_detailed(project_path: str, af3_folder: str):
                             file_name=f"{selected_pred_name}_s{seed}_m{sample}_pae_matrix.csv",
                             mime="text/csv"
                         )
+                elif selected_pred.get('format') == 'alphapulldown':
+                    st.caption("PAE matrix export is not available for AlphaPulldown (no PAE in AF2-multimer output).")
 
-                    # Export contacts (reuse from interface analysis if available)
-                    if cif_file.exists():
-                        iface_key = f"_iface_{model_key}"
-                        if iface_key in st.session_state and st.session_state[iface_key]:
-                            contacts = st.session_state[iface_key].get('contacts', [])
-                        else:
-                            from core.analyzer import calculate_interface_contacts
-                            contacts = calculate_interface_contacts(cif_file, confidences)
+                if cif_file.exists():
+                    iface_key = f"_iface_{model_key}"
+                    if iface_key in st.session_state and st.session_state[iface_key]:
+                        contacts = st.session_state[iface_key].get('contacts', [])
+                    elif confidences is not None:
+                        from core.analyzer import calculate_interface_contacts
+                        contacts = calculate_interface_contacts(cif_file, confidences)
+                    else:
+                        from core.interface_analyzer import analyze_interface_spatial
+                        contacts = analyze_interface_spatial(cif_file).get('contacts', [])
 
-                        if contacts:
-                            import pandas as pd
-                            contact_df = pd.DataFrame(contacts)
-                            csv = contact_df.to_csv(index=False)
+                    if contacts:
+                        import pandas as pd
+                        contact_df = pd.DataFrame(contacts)
+                        csv = contact_df.to_csv(index=False)
 
-                            st.download_button(
-                                label="Download Interface Contacts (CSV)",
-                                data=csv,
-                                file_name=f"{selected_pred_name}_s{seed}_m{sample}_contacts.csv",
-                                mime="text/csv"
-                            )
+                        st.download_button(
+                            label="Download Interface Contacts (CSV)",
+                            data=csv,
+                            file_name=f"{selected_pred_name}_s{seed}_m{sample}_contacts.csv",
+                            mime="text/csv"
+                        )
                 else:
-                    st.warning("No confidences loaded for this model.")
+                    st.warning("Structure file not found for this model.")

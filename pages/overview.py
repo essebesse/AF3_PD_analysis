@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.scanner import AF3Scanner
-from core.utils import format_score
+from core.utils import format_score, split_prediction_name, normalize_cache_records
 
 
 @st.cache_data(ttl=300)
@@ -51,15 +51,19 @@ def show_load_data(project_path: str, af3_folder: str):
         with open(cache_file, 'r') as f:
             cached = json.load(f)
 
+        # Backfill iptm/ptm/ranking_score on legacy caches that stored
+        # only the combined iptm_ptm score
+        normalize_cache_records(cached)
+
         # Summary stats from cache
         best = {}
         for r in cached:
             name = r['prediction_name']
-            iptm = r.get('iptm', 0)
-            if name not in best or iptm > best[name].get('iptm', 0):
+            iptm = r.get('iptm') or 0
+            if name not in best or iptm > (best[name].get('iptm') or 0):
                 best[name] = r
         per_pred = list(best.values())
-        iptms = [r.get('iptm', 0) for r in per_pred]
+        iptms = [r.get('iptm') or 0 for r in per_pred]
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Predictions", total)
@@ -93,12 +97,7 @@ def show_load_data(project_path: str, af3_folder: str):
             display_data = []
             for r in top_20:
                 pred_name = r['prediction_name']
-                if '_and_' in pred_name:
-                    bait, prey = pred_name.split('_and_', 1)
-                else:
-                    bait, prey = pred_name, ''
-                bait_acc = bait.upper()
-                prey_acc = prey.upper()
+                bait_acc, prey_acc = split_prediction_name(pred_name)
                 bait_gene = gene_cache.get(bait_acc, '')
                 prey_gene = gene_cache.get(prey_acc, '')
                 bait_label = f"{bait_gene} ({bait_acc})" if bait_gene else bait_acc
@@ -125,11 +124,11 @@ def show_load_data(project_path: str, af3_folder: str):
 
             unique_accs = set()
             for r in cached:
-                pred_name = r['prediction_name']
-                if '_and_' in pred_name:
-                    bait, prey = pred_name.split('_and_', 1)
-                    unique_accs.add(bait.upper())
-                    unique_accs.add(prey.upper())
+                bait_acc, prey_acc = split_prediction_name(r['prediction_name'])
+                if bait_acc:
+                    unique_accs.add(bait_acc)
+                if prey_acc:
+                    unique_accs.add(prey_acc)
 
             missing_accs = [acc for acc in unique_accs if acc not in gene_cache]
             if missing_accs:
@@ -144,12 +143,7 @@ def show_load_data(project_path: str, af3_folder: str):
             rows = []
             for r in cached:
                 pred_name = r['prediction_name']
-                if '_and_' in pred_name:
-                    bait, prey = pred_name.split('_and_', 1)
-                else:
-                    bait, prey = pred_name, ''
-                bait_acc = bait.upper()
-                prey_acc = prey.upper()
+                bait_acc, prey_acc = split_prediction_name(pred_name)
                 bait_gene = gene_cache.get(bait_acc, '')
                 prey_gene = gene_cache.get(prey_acc, '')
                 bait_label = f"{bait_gene} ({bait_acc})" if bait_gene else bait_acc

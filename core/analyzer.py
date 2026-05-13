@@ -11,6 +11,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 import re
+import gemmi
 
 
 def calculate_asymmetric_ipsae(pae_matrix: np.ndarray,
@@ -64,8 +65,14 @@ def calculate_ipsae(pae_matrix: np.ndarray,
 
 
 class CIFParser:
-    """Parser for mmCIF files to extract atomic coordinates.
-    Ported from AF3_PD_analysis_v4.py."""
+    """mmCIF parser used by the analysis pipeline.
+
+    Backed by gemmi (handles edge cases the legacy hand-rolled tokenizer
+    missed: multi-character atom/residue names, quoted strings, alternate
+    locations, varying column orderings). The ``atoms`` list preserves the
+    same shape as before — ordered by CIF appearance — so downstream code
+    that relies on positional ``atom_plddts`` indexing keeps working.
+    """
 
     def __init__(self, cif_file: str, verbose: bool = False):
         self.cif_file = cif_file
@@ -76,77 +83,36 @@ class CIFParser:
     def parse_atoms(self) -> bool:
         """Parse atomic coordinates from CIF file."""
         try:
-            with open(self.cif_file, 'r') as f:
-                lines = f.readlines()
-
-            # Find the atom site loop
-            atom_section_start = -1
-            for i, line in enumerate(lines):
-                if '_atom_site.group_PDB' in line:
-                    atom_section_start = i
-                    break
-
-            if atom_section_start == -1:
-                if self.verbose:
-                    print(f"Warning: No atom section found in {self.cif_file}")
-                return False
-
-            # Find column indices by reading _atom_site.* header lines
-            coord_columns = {}
-            current_line = atom_section_start
-
-            while current_line < len(lines) and lines[current_line].strip().startswith('_atom_site.'):
-                line = lines[current_line].strip()
-                col_index = current_line - atom_section_start
-                if '.Cartn_x' in line:
-                    coord_columns['x'] = col_index
-                elif '.Cartn_y' in line:
-                    coord_columns['y'] = col_index
-                elif '.Cartn_z' in line:
-                    coord_columns['z'] = col_index
-                elif '.label_seq_id' in line:
-                    coord_columns['seq_id'] = col_index
-                elif '.label_asym_id' in line:
-                    coord_columns['chain_id'] = col_index
-                elif '.label_atom_id' in line:
-                    coord_columns['atom_name'] = col_index
-                elif '.label_comp_id' in line:
-                    coord_columns['res_name'] = col_index
-                current_line += 1
-
-            # Parse atom records (data lines start after all headers)
-            data_start = current_line
-            for line_num in range(data_start, len(lines)):
-                line = lines[line_num].strip()
-                if not line or line.startswith('#') or not line.startswith('ATOM'):
-                    continue
-
-                parts = line.split()
-                if len(parts) < 15:
-                    continue
-
-                try:
-                    atom_info = {
-                        'seq_id': int(parts[coord_columns['seq_id']]),
-                        'chain_id': parts[coord_columns['chain_id']],
-                        'atom_name': parts[coord_columns['atom_name']],
-                        'res_name': parts[coord_columns.get('res_name', 4)] if 'res_name' in coord_columns else 'UNK',
-                        'x': float(parts[coord_columns['x']]),
-                        'y': float(parts[coord_columns['y']]),
-                        'z': float(parts[coord_columns['z']])
-                    }
-                    self.atoms.append(atom_info)
-                except (ValueError, IndexError):
-                    continue
-
-            if self.verbose:
-                print(f"Parsed {len(self.atoms)} atoms from {self.cif_file}")
-            return len(self.atoms) > 0
-
+            structure = gemmi.read_structure(self.cif_file)
         except Exception as e:
             if self.verbose:
                 print(f"Error parsing CIF file {self.cif_file}: {e}")
             return False
+
+        if len(structure) == 0:
+            return False
+
+        # Use the first model; AF3 always emits a single model per CIF.
+        model = structure[0]
+        for chain in model:
+            cid = chain.name
+            for residue in chain:
+                seq_id = residue.seqid.num
+                res_name = residue.name
+                for atom in residue:
+                    self.atoms.append({
+                        'seq_id': seq_id,
+                        'chain_id': cid,
+                        'atom_name': atom.name,
+                        'res_name': res_name,
+                        'x': atom.pos.x,
+                        'y': atom.pos.y,
+                        'z': atom.pos.z,
+                    })
+
+        if self.verbose:
+            print(f"Parsed {len(self.atoms)} atoms from {self.cif_file}")
+        return len(self.atoms) > 0
 
     def get_residue_atoms(self, chain_id: str, seq_id: int) -> List[Dict]:
         """Get all atoms for a specific residue."""
@@ -209,17 +175,20 @@ def load_confidences(pred_dir: Path, prefix: str, seed: Optional[int] = None,
                      sample: Optional[int] = None) -> Optional[Dict]:
     """
     Load confidences.json from a prediction directory.
-    Handles both naming conventions. Falls back to top-level files when
-    per-sample files don't exist (common when only top-ranked model is stored).
+    Handles local-pipeline naming (with seed-N_sample-M subdirs), the
+    AF3 Server flat layout ({prefix}_full_data_{sample}.json with no
+    seed dirs), and the top-level fallback when only the top model is stored.
     """
     candidates = []
 
     if seed is not None and sample is not None:
-        # Try sample-specific files first
+        # Local pipeline — sample-specific files
         candidates.append(pred_dir / f"{prefix}_seed-{seed}_sample-{sample}_confidences.json")
         sample_dir = pred_dir / f"seed-{seed}_sample-{sample}"
         candidates.append(sample_dir / "confidences.json")
         candidates.append(sample_dir / f"{prefix}_seed-{seed}_sample-{sample}_confidences.json")
+        # AF3 Server flat — full_data_<sample>.json holds the same PAE/atom_plddts payload
+        candidates.append(pred_dir / f"{prefix}_full_data_{sample}.json")
 
     # Always fall back to top-level files
     candidates.append(pred_dir / f"{prefix}_confidences.json")
@@ -236,7 +205,8 @@ def load_summary(pred_dir: Path, prefix: str, seed: Optional[int] = None,
                  sample: Optional[int] = None) -> Optional[Dict]:
     """
     Load summary_confidences.json from a prediction directory.
-    Falls back to top-level files when per-sample files don't exist.
+    Handles local-pipeline + AF3 Server flat layouts and falls back to
+    top-level files when only the top model is stored.
     """
     candidates = []
 
@@ -245,6 +215,8 @@ def load_summary(pred_dir: Path, prefix: str, seed: Optional[int] = None,
         sample_dir = pred_dir / f"seed-{seed}_sample-{sample}"
         candidates.append(sample_dir / "summary_confidences.json")
         candidates.append(sample_dir / f"{prefix}_seed-{seed}_sample-{sample}_summary_confidences.json")
+        # AF3 Server flat
+        candidates.append(pred_dir / f"{prefix}_summary_confidences_{sample}.json")
 
     candidates.append(pred_dir / f"{prefix}_summary_confidences.json")
     candidates.append(pred_dir / "summary_confidences.json")
@@ -530,19 +502,28 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
     """
     Analyze models in a prediction directory.
 
-    Supports both local AF3 pipeline format (seed-N_sample-M subdirs +
-    ranking_scores.csv) and AF3 Server flat format (fold_*_model_N.cif +
-    fold_*_full_data_N.json files directly in the folder).
+    Supports three input formats:
+      * AF3 local pipeline (seed-N_sample-M/ subdirs + ranking_scores.csv)
+      * AF3 Server flat (fold_*_model_N.cif + fold_*_full_data_N.json)
+      * AlphaPulldown / AF2-multimer (ranked_N.pdb + ranking_debug.json)
+
+    The AlphaPulldown path is partial: no PAE matrix is available, so ipSAE
+    and PAE-binned contacts are ``None``; iPTM is the combined iptm+ptm
+    score, and ``interface_plddt`` is mean B-factor pLDDT over CB atoms in
+    spatial CB-CB contact (< 8 Å).
 
     Args:
         top_only: If True, only analyze the top-ranked model.
     Returns list of analysis results, one per model.
     """
-    from core.scanner import resolve_prediction_dir, _is_af3_server_flat
+    from core.scanner import resolve_prediction_dir, _is_af3_server_flat, _is_alphapulldown_format
     pred_dir = resolve_prediction_dir(pred_dir)
 
     if _is_af3_server_flat(pred_dir):
         return _analyze_server_flat(pred_dir, ipsae_pae_cutoff, top_only)
+
+    if _is_alphapulldown_format(pred_dir):
+        return _analyze_alphapulldown(pred_dir, top_only)
 
     results = []
     pred_name = pred_dir.name
@@ -750,3 +731,119 @@ def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
     except Exception as e:
         print(f"Error analyzing server model {model_idx}: {e}")
         return None
+
+
+def _analyze_alphapulldown(pred_dir: Path, top_only: bool = False) -> List[Dict]:
+    """Analyze an AlphaPulldown (AF2-multimer) prediction folder.
+
+    Reads ``ranking_debug.json`` for per-model iptm+ptm scores, then
+    computes spatial interface contacts (CB-CB < 8 Å) and interface pLDDT
+    (mean B-factor of CB atoms at the interface) from each ``ranked_N.pdb``.
+    No PAE information is available in this output format.
+    """
+    rd_file = pred_dir / "ranking_debug.json"
+    if not rd_file.is_file():
+        return []
+    try:
+        with open(rd_file) as f:
+            rd = json.load(f)
+    except Exception:
+        return []
+
+    scores = rd.get("iptm+ptm") or rd.get("iptm_ptm") or {}
+    order = rd.get("order") or list(scores.keys())
+    if not scores or not order:
+        return []
+
+    pred_name = pred_dir.name
+    indices = [0] if top_only else list(range(len(order)))
+
+    results = []
+    for idx in indices:
+        model_key = order[idx] if idx < len(order) else None
+        score = float(scores.get(model_key, 0)) if model_key else 0.0
+        pdb_path = pred_dir / f"ranked_{idx}.pdb"
+        if not pdb_path.is_file():
+            continue
+
+        contacts_count, iface_plddt = _interface_metrics_from_pdb(pdb_path)
+
+        results.append({
+            'seed': 0,
+            'sample': idx,
+            'iptm': score,          # combined iptm+ptm — only confidence score available
+            'ptm': score,
+            'ranking_score': score,
+            'ipsae': None,
+            'interface_plddt': round(iface_plddt, 2) if iface_plddt is not None else None,
+            'contacts_pae3': None,
+            'contacts_pae5': None,
+            'contacts_pae8': None,
+            'contacts_spatial': contacts_count,   # CB-CB pairs < 8 Å, no PAE filter
+            'fraction_disordered': 0,
+            'pae_mean': None,
+            'is_top_ranked': (idx == 0),
+            'prediction_name': pred_name,
+            'format': 'alphapulldown',
+            'model_key': model_key,
+        })
+
+    return results
+
+
+def _interface_metrics_from_pdb(pdb_path: Path,
+                                  distance_cutoff: float = 8.0
+                                  ) -> Tuple[int, Optional[float]]:
+    """Spatial interface contact count + mean CB pLDDT (B-factor) for an
+    AF2-multimer PDB. No PAE filtering. Returns ``(n_contacts, mean_plddt)``;
+    mean_plddt is ``None`` if no interface was found.
+    """
+    import gemmi
+    try:
+        structure = gemmi.read_structure(str(pdb_path))
+    except Exception:
+        return 0, None
+    if len(structure) == 0:
+        return 0, None
+    model = structure[0]
+
+    # Collect CB coords per chain (CA fallback for glycine), with B-factor pLDDT
+    cb_by_chain: Dict[str, List[Tuple[int, float, float, float, float]]] = {}
+    for chain in model:
+        entries = []
+        for residue in chain:
+            cb = residue.find_atom('CB', '\0') or residue.find_atom('CA', '\0')
+            if cb is not None:
+                entries.append((
+                    residue.seqid.num,
+                    cb.pos.x, cb.pos.y, cb.pos.z,
+                    cb.b_iso,
+                ))
+        if entries:
+            cb_by_chain[chain.name] = entries
+
+    chain_ids = list(cb_by_chain.keys())
+    if len(chain_ids) < 2:
+        return 0, None
+    a_id, b_id = chain_ids[0], chain_ids[1]
+    a_atoms = cb_by_chain[a_id]
+    b_atoms = cb_by_chain[b_id]
+
+    dist_sq = distance_cutoff * distance_cutoff
+    n_contacts = 0
+    iface_a, iface_b = set(), set()
+    for (ra, ax, ay, az, _) in a_atoms:
+        for (rb, bx, by, bz, _) in b_atoms:
+            dx, dy, dz = ax - bx, ay - by, az - bz
+            if dx*dx + dy*dy + dz*dz <= dist_sq:
+                n_contacts += 1
+                iface_a.add(ra)
+                iface_b.add(rb)
+
+    if not iface_a and not iface_b:
+        return 0, None
+
+    plddts = [bf for (r, _, _, _, bf) in a_atoms if r in iface_a]
+    plddts += [bf for (r, _, _, _, bf) in b_atoms if r in iface_b]
+    mean_plddt = sum(plddts) / len(plddts) if plddts else None
+    return n_contacts, mean_plddt

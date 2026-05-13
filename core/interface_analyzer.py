@@ -256,6 +256,99 @@ def analyze_interface(cif_path: Path,
     }
 
 
+def analyze_interface_spatial(cif_path: Path,
+                               distance_cutoff: float = 8.0) -> dict:
+    """Spatial-only interface analysis (no PAE filter).
+
+    Used for AlphaPulldown / AF2-multimer output where the per-residue PAE
+    matrix is not available. Returns the same dict shape as
+    ``analyze_interface``; the ``pae`` field of each contact is ``None``.
+    """
+    if not cif_path.exists():
+        return {'contacts': [], 'hub_residues_a': [], 'hub_residues_b': [],
+                'chemical_breakdown': {}, 'summary': {}}
+
+    parser = CIFParser(str(cif_path), verbose=False)
+    if not parser.parse_atoms():
+        return {'contacts': [], 'hub_residues_a': [], 'hub_residues_b': [],
+                'chemical_breakdown': {}, 'summary': {}}
+
+    chain_ids = parser.get_chain_ids()
+    if len(chain_ids) < 2:
+        return {'contacts': [], 'hub_residues_a': [], 'hub_residues_b': [],
+                'chemical_breakdown': {}, 'summary': {}}
+
+    chain_a_id, chain_b_id = chain_ids[0], chain_ids[1]
+    chain_a_residues = parser.get_chain_residues(chain_a_id)
+    chain_b_residues = parser.get_chain_residues(chain_b_id)
+
+    cb_coords = {}
+    res_names = {}
+    for atom in parser.atoms:
+        key = (atom['chain_id'], atom['seq_id'])
+        if atom['atom_name'] == 'CB':
+            cb_coords[key] = (atom['x'], atom['y'], atom['z'])
+        elif atom['atom_name'] == 'CA' and key not in cb_coords:
+            cb_coords[key] = (atom['x'], atom['y'], atom['z'])
+        if key not in res_names:
+            res_names[key] = atom['res_name']
+
+    contacts = []
+    for res_a in chain_a_residues:
+        coord_a = cb_coords.get((chain_a_id, res_a))
+        if coord_a is None:
+            continue
+        for res_b in chain_b_residues:
+            coord_b = cb_coords.get((chain_b_id, res_b))
+            if coord_b is None:
+                continue
+            dx = coord_a[0] - coord_b[0]
+            dy = coord_a[1] - coord_b[1]
+            dz = coord_a[2] - coord_b[2]
+            dist = (dx*dx + dy*dy + dz*dz) ** 0.5
+            if dist > distance_cutoff:
+                continue
+            res_name_a = res_names.get((chain_a_id, res_a), 'UNK')
+            res_name_b = res_names.get((chain_b_id, res_b), 'UNK')
+            contacts.append({
+                'chain_a_res': res_a,
+                'chain_b_res': res_b,
+                'distance': round(dist, 2),
+                'pae': None,
+                'chain_a_aa': res_name_a,
+                'chain_b_aa': res_name_b,
+                'interaction_type': classify_interaction(res_name_a, res_name_b, dist),
+            })
+
+    hub_residues_a = find_hub_residues(contacts, 'chain_a_res')
+    hub_residues_b = find_hub_residues(contacts, 'chain_b_res')
+
+    chemical_breakdown = {}
+    for c in contacts:
+        chemical_breakdown[c['interaction_type']] = chemical_breakdown.get(c['interaction_type'], 0) + 1
+
+    if contacts:
+        mean_distance = float(np.mean([c['distance'] for c in contacts]))
+    else:
+        mean_distance = 0
+
+    summary = {
+        'total_contacts': len(contacts),
+        'mean_pae': None,
+        'mean_distance': round(mean_distance, 2),
+        'interface_area_estimate': len({c['chain_a_res'] for c in contacts}) +
+                                   len({c['chain_b_res'] for c in contacts}),
+    }
+
+    return {
+        'contacts': contacts,
+        'hub_residues_a': hub_residues_a,
+        'hub_residues_b': hub_residues_b,
+        'chemical_breakdown': chemical_breakdown,
+        'summary': summary,
+    }
+
+
 def find_hub_residues(contacts: List[dict], chain_key: str,
                       min_contacts: int = 3) -> List[Tuple[int, str, int]]:
     """

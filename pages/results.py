@@ -12,7 +12,7 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.scanner import AF3Scanner
-from core.utils import format_score, calculate_confidence_tier, tier_color
+from core.utils import format_score, calculate_confidence_tier, tier_color, split_prediction_name, normalize_cache_records
 
 
 def show_results(project_path: str, af3_folder: str):
@@ -36,6 +36,9 @@ def show_results(project_path: str, af3_folder: str):
         import json
         with open(cache_file, 'r') as f:
             analysis_results = json.load(f)
+        # Backfill iptm/ptm/ranking_score on legacy caches that stored
+        # only the combined iptm_ptm score
+        normalize_cache_records(analysis_results)
     else:
         st.warning("⚠️ No cached analysis found. Run full analysis on the Analyze step for per-model metrics including ipSAE.")
 
@@ -84,7 +87,6 @@ def show_results(project_path: str, af3_folder: str):
         )
 
     with col2:
-        iptm_min, iptm_max = 0.0, 1.0
         iptm_range = st.slider(
             "iPTM Range:",
             min_value=0.0, max_value=1.0,
@@ -113,7 +115,10 @@ def show_results(project_path: str, af3_folder: str):
         filtered_results = [r for r in filtered_results if get_tier(r) == confidence_filter]
 
     if iptm_range != (0.0, 1.0):
-        filtered_results = [r for r in filtered_results if iptm_range[0] <= r['iptm'] <= iptm_range[1]]
+        filtered_results = [
+            r for r in filtered_results
+            if iptm_range[0] <= (r.get('iptm') or 0) <= iptm_range[1]
+        ]
 
     if model_filter == "Top-ranked only":
         filtered_results = [r for r in filtered_results if r.get('is_top_ranked', False)]
@@ -126,11 +131,11 @@ def show_results(project_path: str, af3_folder: str):
 
     unique_accs = set()
     for r in filtered_results:
-        pred_name = r['prediction_name']
-        if '_and_' in pred_name:
-            bait, prey = pred_name.split('_and_', 1)
-            unique_accs.add(bait.upper())
-            unique_accs.add(prey.upper())
+        bait_acc, prey_acc = split_prediction_name(r['prediction_name'])
+        if bait_acc:
+            unique_accs.add(bait_acc)
+        if prey_acc:
+            unique_accs.add(prey_acc)
 
     missing_accs = [acc for acc in unique_accs if acc not in gene_cache]
     if missing_accs:
@@ -143,10 +148,8 @@ def show_results(project_path: str, af3_folder: str):
 
     def _pred_label(pred_name):
         """Turn 'q9bw83_and_q9ujt0' into 'IFT27 × TUBE1 (Q9BW83 × Q9UJT0)'."""
-        if '_and_' in pred_name:
-            bait, prey = pred_name.split('_and_', 1)
-            bait_acc = bait.upper()
-            prey_acc = prey.upper()
+        bait_acc, prey_acc = split_prediction_name(pred_name)
+        if prey_acc:
             bait_gene = gene_cache.get(bait_acc, '')
             prey_gene = gene_cache.get(prey_acc, '')
             if bait_gene and prey_gene:
@@ -178,12 +181,7 @@ def show_results(project_path: str, af3_folder: str):
         model_label = "Top" if r.get('is_top_ranked') else f"s{r['seed']}-m{r['sample']}"
 
         pred_name = r['prediction_name']
-        if '_and_' in pred_name:
-            bait, prey = pred_name.split('_and_', 1)
-        else:
-            bait, prey = pred_name, ''
-        bait_acc = bait.upper()
-        prey_acc = prey.upper()
+        bait_acc, prey_acc = split_prediction_name(pred_name)
         bait_gene = gene_cache.get(bait_acc, '')
         prey_gene = gene_cache.get(prey_acc, '')
         # Always show gene name (if available) followed by UniProt ID

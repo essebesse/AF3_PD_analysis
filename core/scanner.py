@@ -58,20 +58,48 @@ def _is_af3_server_flat(d: Path) -> bool:
         return False
 
 
+def _is_alphapulldown_format(d: Path) -> bool:
+    """
+    Detect AlphaPulldown (AlphaFold 2 multimer) output format.
+
+    AlphaPulldown produces ``ranked_<N>.pdb`` files (typically 0..4) plus
+    ``ranking_debug.json`` (with ``iptm+ptm`` scores) directly inside the
+    prediction folder. No PAE matrix is available — analysis is therefore
+    limited to combined iptm+ptm, spatial interface contacts, and
+    per-residue pLDDT from PDB B-factors.
+    """
+    try:
+        if not (d / "ranking_debug.json").is_file():
+            return False
+        return (d / "ranked_0.pdb").is_file()
+    except (PermissionError, OSError):
+        return False
+
+
 def _dir_has_predictions(d: Path) -> bool:
-    """Check if a directory directly contains AF3 prediction subdirectories."""
+    """
+    Check if a directory directly contains prediction data — either AF3
+    flat server files in d itself, or AF3/AlphaPulldown prediction
+    subdirectories inside d.
+    """
+    # Flat server format: the files are directly inside d (no subdirs needed)
+    if _is_af3_server_flat(d):
+        return True
     try:
         for child in d.iterdir():
             if not child.is_dir() or child.name.startswith('.'):
                 continue
             resolved = resolve_prediction_dir(child)
-            # AF3 Server flat format
+            # AF3 Server flat format in a child dir
             if _is_af3_server_flat(resolved):
                 return True
-            # Check for summary_confidences.json (with or without name prefix)
+            # AlphaPulldown (AF2-multimer)
+            if _is_alphapulldown_format(resolved):
+                return True
+            # Local pipeline: summary_confidences.json present
             if any(resolved.glob('*summary_confidences.json')):
                 return True
-            # Check for seed directories
+            # Local pipeline: seed subdirectories
             if any(c.is_dir() and c.name.startswith('seed-') for c in resolved.iterdir()):
                 return True
     except PermissionError:
@@ -90,6 +118,22 @@ def find_af3_projects_recursive(root: str, max_depth: int = 6) -> List[Dict]:
     """
     results = []
     root_path = Path(root)
+
+    # Check if root itself is a flat server prediction (user browsed into it)
+    if _is_af3_server_flat(root_path):
+        pred_name = root_path.name
+        name_part = pred_name[5:] if pred_name.startswith('fold_') else pred_name
+        and_match = re.match(r'(.+)_and_(.+)', name_part)
+        if and_match:
+            bait_name, prey_name = and_match.group(1), and_match.group(2)
+        else:
+            bait_name, prey_name = name_part, ""
+        return [{
+            'project_path': str(root_path),
+            'af3_folder': str(root_path),
+            'label': root_path.name,
+            'format': 'server_flat',
+        }]
 
     def _walk(current: Path, depth: int):
         if depth > max_depth:
@@ -239,11 +283,74 @@ def _load_server_flat_prediction(pred_dir: Path) -> Optional[Dict]:
         return None
 
 
+def _load_alphapulldown_prediction(pred_dir: Path) -> Optional[Dict]:
+    """
+    Load summary data for an AlphaPulldown (AF2-multimer) prediction.
+
+    Reads ``ranking_debug.json`` to get the per-model combined iptm+ptm
+    scores. iPTM and PTM cannot be separated in this format, so we report
+    the combined value as ``iptm`` (the only ranking score available) and
+    leave PAE-derived fields unset.
+    """
+    try:
+        rd_file = pred_dir / "ranking_debug.json"
+        if not rd_file.is_file():
+            return None
+        with open(rd_file, 'r') as f:
+            rd = json.load(f)
+
+        scores = rd.get("iptm+ptm") or rd.get("iptm_ptm") or {}
+        order = rd.get("order") or list(scores.keys())
+        if not scores or not order:
+            return None
+
+        # Top-ranked model first, then the rest in scoring order
+        seed_samples = []
+        for idx, model_key in enumerate(order):
+            score = float(scores.get(model_key, 0))
+            seed_samples.append({
+                'seed': 0,
+                'sample': idx,
+                'ranking_score': score,
+                'iptm': score,       # combined iptm+ptm, kept here for per-model display
+                'ptm': score,
+                'model_key': model_key,  # original AF2 model name (model_1_multimer_v3_pred_0)
+            })
+
+        top = seed_samples[0]
+        pred_name = pred_dir.name
+        match = re.match(r'(.+)_and_(.+)', pred_name)
+        if match:
+            bait_name, prey_name = match.group(1), match.group(2)
+        else:
+            bait_name, prey_name = pred_name, ""
+
+        return {
+            'name': pred_name,
+            'bait': bait_name,
+            'prey': prey_name,
+            'iptm': top['ranking_score'],
+            'ptm': top['ranking_score'],
+            'ranking_score': top['ranking_score'],
+            'fraction_disordered': 0,
+            'has_clash': 0,
+            'chain_iptm': [],
+            'chain_pair_iptm': [],
+            'chain_ptm': [],
+            'seed_samples': seed_samples,
+            'prediction_dir': str(pred_dir),
+            'format': 'alphapulldown',
+        }
+    except Exception as e:
+        print(f"Error loading AlphaPulldown prediction {pred_dir}: {e}")
+        return None
+
+
 def load_prediction_data(pred_dir: Path) -> Optional[Dict]:
     """
     Load summary data for a single prediction directory.
-    Reads only summary_confidences.json (~330B) and ranking_scores.csv (~150B).
-    Handles AF3 Server nesting (name/name/) and flat server format automatically.
+    Handles AF3 local pipeline, AF3 Server flat, AF3 Server nesting,
+    and AlphaPulldown (AF2-multimer) formats automatically.
     """
     try:
         # Resolve AF3 Server extra nesting
@@ -253,6 +360,10 @@ def load_prediction_data(pred_dir: Path) -> Optional[Dict]:
         # --- AF3 Server flat format ---
         if _is_af3_server_flat(pred_dir):
             return _load_server_flat_prediction(pred_dir)
+
+        # --- AlphaPulldown / AF2-multimer ---
+        if _is_alphapulldown_format(pred_dir):
+            return _load_alphapulldown_prediction(pred_dir)
 
         # Find summary_confidences.json
         summary_file = pred_dir / f"{pred_name}_summary_confidences.json"
@@ -364,6 +475,23 @@ class AF3Scanner:
                     'prey': prey_name,
                     'prediction_dir': str(resolved),
                     'format': 'server_flat',
+                })
+                continue
+
+            # AlphaPulldown / AF2-multimer
+            if _is_alphapulldown_format(resolved):
+                pred_name = resolved.name
+                match = re.match(r'(.+)_and_(.+)', pred_name)
+                if match:
+                    bait_name, prey_name = match.group(1), match.group(2)
+                else:
+                    bait_name, prey_name = pred_name, ""
+                self.predictions.append({
+                    'name': pred_name,
+                    'bait': bait_name,
+                    'prey': prey_name,
+                    'prediction_dir': str(resolved),
+                    'format': 'alphapulldown',
                 })
                 continue
 

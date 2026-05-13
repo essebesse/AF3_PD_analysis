@@ -1,19 +1,40 @@
 """
-3D structure viewer for Streamlit using 3Dmol.js (served as static file).
+3D structure viewer for Streamlit using 3Dmol.js.
 
 Embeds an interactive 3D viewer via st.components.v1.html() with
 PAE-based interface coloring. Interface residues are identified using both
 inter-chain PAE and spatial proximity.
 
-3Dmol.js is loaded from CDN (jsdelivr),
-keeping the HTML small (~5KB + CIF) for fast model switching.
+3Dmol.js is served locally from ./static/3Dmol-min.js via Streamlit's static
+file server (enableStaticServing = true in .streamlit/config.toml) so the
+viewer works on air-gapped/HPC networks with no internet access. The HTML
+stays small (~5KB + CIF) because the JS is fetched once and browser-cached.
 """
 
 import json as _json
 import numpy as np
 import gemmi
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
+@lru_cache(maxsize=1)
+def _load_3dmol_js() -> Optional[str]:
+    """Read 3Dmol-min.js once and cache it in memory.
+
+    Inlining the JS into each viewer HTML avoids the entire class of
+    "Streamlit static serving not enabled / not configured / file not at
+    expected URL" failures we previously hit with ``<script src="/app/static/...">``.
+    The 526 KB string is held in memory for the life of the Streamlit process.
+    """
+    js_path = Path(__file__).parent.parent / "static" / "3Dmol-min.js"
+    if not js_path.is_file():
+        return None
+    try:
+        return js_path.read_text()
+    except Exception:
+        return None
 
 
 def compute_interface_pae_per_residue(
@@ -157,12 +178,17 @@ def generate_viewer_html(
     chain_names: Optional[List[str]] = None,
     chain_ids_all: Optional[List[str]] = None,
     height: int = 600,
+    model_format: str = "cif",
 ) -> str:
     """
     Generate HTML with 3Dmol.js viewer.
 
-    3Dmol.js is loaded from Streamlit static file server (not inline).
+    3Dmol.js is loaded from Streamlit's static file server at
+    /app/static/3Dmol-min.js (no CDN, works offline).
     PAE interface coloring is always applied when data is available.
+
+    ``model_format`` is the file-type token passed to 3Dmol's ``addModel``;
+    pass ``"pdb"`` for AlphaPulldown ranked_N.pdb files, ``"cif"`` for AF3.
     """
     all_chains = chain_ids_all or (list(pae_residue_data.keys()) if pae_residue_data else [])
 
@@ -255,6 +281,18 @@ def generate_viewer_html(
         No confident interface residues detected (PAE &lt; 12 &#197; + distance &lt; 8 &#197;)
     </div>'''
 
+    # Inline 3Dmol-min.js directly so we don't depend on Streamlit's static
+    # file server being configured/enabled. The lru_cache means we pay the
+    # 526 KB read once per process, not once per render.
+    three_dmol_js = _load_3dmol_js()
+    if three_dmol_js is None:
+        inline_script = (
+            'document.getElementById("viewer_fallback").textContent = '
+            '"3Dmol.js bundle not found at static/3Dmol-min.js — reinstall the app.";'
+        )
+    else:
+        inline_script = three_dmol_js
+
     html = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -264,23 +302,26 @@ def generate_viewer_html(
 <div id="container" style="width:100%;height:{height}px;position:relative;">
     <div id="viewer" style="width:100%;height:100%;">
         <div id="viewer_fallback" style="padding:40px;text-align:center;color:#b91c1c;font-family:Arial,sans-serif;">
-            3Dmol.js failed to load.<br>
-            This usually means you are on an isolated network without CDN access.<br>
-            The PAE plots and other analysis tabs still work.
+            Loading 3D viewer…
         </div>
     </div>
     {legend_html}
     {no_iface_msg}
 </div>
-<script src="https://cdn.jsdelivr.net/npm/3dmol@2.5.4/build/3Dmol-min.js"></script>
+<script>
+{inline_script}
+</script>
 <script>
     if (typeof $3Dmol !== "undefined") {{
         document.getElementById("viewer_fallback").remove();
         var viewer = $3Dmol.createViewer("viewer", {{backgroundColor: "white"}});
-        viewer.addModel({cif_escaped}, "cif");
+        viewer.addModel({cif_escaped}, {_json.dumps(model_format)});
 {style_js}
         viewer.zoomTo();
         viewer.render();
+    }} else {{
+        document.getElementById("viewer_fallback").textContent =
+            "3Dmol.js loaded but $3Dmol global is undefined — bundle may be corrupted.";
     }}
 </script>
 </body>
