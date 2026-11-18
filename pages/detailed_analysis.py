@@ -618,7 +618,7 @@ def show_detailed(project_path: str, af3_folder: str):
                     })
 
                 comp_df = pd.DataFrame(comparison_data)
-                st.dataframe(comp_df, width='stretch')
+                st.dataframe(comp_df, width='stretch', hide_index=True)
 
                 # Side-by-side PAE matrix comparison — AF3 only
                 _show_pae_comparison = selected_pred.get('format') != 'alphapulldown'

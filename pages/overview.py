@@ -81,7 +81,12 @@ def show_load_data(project_path: str, af3_folder: str):
         # iPTM histogram
         import matplotlib.pyplot as plt
         fig_hist, ax_hist = plt.subplots(figsize=(10, 4))
-        ax_hist.hist(iptms, bins=50, color='steelblue', edgecolor='white')
+        # Fixed 0-1 bins (0.02 wide) so pulldowns are comparable; counts are
+        # whole predictions, so integer y ticks only.
+        from matplotlib.ticker import MaxNLocator
+        ax_hist.hist(iptms, bins=[i / 50 for i in range(51)], color='steelblue', edgecolor='white')
+        ax_hist.set_xlim(0, 1)
+        ax_hist.yaxis.set_major_locator(MaxNLocator(integer=True))
         ax_hist.axvline(x=0.5, color='red', linestyle='--', label='iPTM=0.5')
         ax_hist.axvline(x=0.8, color='green', linestyle='--', label='iPTM=0.8')
         ax_hist.set_xlabel('iPTM')
