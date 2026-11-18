@@ -86,15 +86,24 @@ def check_job_status(job_id: str) -> Dict:
         elif not status:
             # Job no longer in queue — likely completed, failed, or cancelled.
             # Use sacct for definitive status if available.
+            # -X: one line per job / array task (no job steps). For an array,
+            # summarise all tasks so one failed task is not hidden behind task 0.
             try:
                 sacct = subprocess.run(
-                    ['sacct', '-j', job_id, '--noheader', '-o', 'State', '-P'],
+                    ['sacct', '-j', job_id, '-X', '--noheader', '-o', 'State', '-P'],
                     capture_output=True, text=True, timeout=15
                 )
-                sacct_status = sacct.stdout.strip().split('\n')[0].strip() if sacct.stdout.strip() else ''
-                if sacct_status:
-                    done = sacct_status not in ('RUNNING', 'PENDING')
-                    return {'status': sacct_status, 'running': not done, 'completed': done}
+                # "CANCELLED by 1234" -> "CANCELLED"
+                states = [s.split()[0] for s in sacct.stdout.split('\n') if s.strip()]
+                if states:
+                    if any(s in ('RUNNING', 'PENDING', 'CONFIGURING') for s in states):
+                        return {'status': 'RUNNING', 'running': True, 'completed': False}
+                    bad = [s for s in states if s != 'COMPLETED']
+                    if not bad:
+                        return {'status': 'COMPLETED', 'running': False, 'completed': True}
+                    detail = ', '.join(sorted(set(bad)))
+                    return {'status': f"FAILED: {len(bad)} of {len(states)} task(s) ({detail})",
+                            'running': False, 'completed': True}
             except Exception:
                 pass
             return {'status': 'COMPLETED', 'running': False, 'completed': True}

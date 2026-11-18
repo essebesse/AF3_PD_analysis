@@ -338,12 +338,9 @@ def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cu
         from core.analyzer import analyze_prediction_all_models
         import json
 
-        # Get all prediction directories (resolve AF3 Server nesting)
-        all_pred_dirs = []
-        for d in os.listdir(af3_folder):
-            d_path = Path(af3_folder) / d
-            if d_path.is_dir() and not d.startswith('seed-') and not d.startswith('.'):
-                all_pred_dirs.append(resolve_prediction_dir(d_path))
+        # Same prediction list as the scanner and the SLURM path (handles AF3
+        # Server nesting, and a folder that is itself one AF2/Server prediction)
+        all_pred_dirs = [Path(p['prediction_dir']) for p in AF3Scanner(Path(af3_folder)).scan()]
 
         if not all_pred_dirs:
             st.warning("No prediction directories found.")
@@ -723,7 +720,7 @@ def _cleanup_slurm_scratch(af3_folder: str):
 
 def show_slurm_execution(project_path: str, af3_folder: str, pred_count: int):
     """Display SLURM cluster submission options."""
-    from core.slurm_config import load_slurm_config, CONFIG_FILE
+    from core.slurm_config import load_slurm_config, CONFIG_FILE, MAX_JOBS
 
     # Always-visible folder-driven run-state panel (works without session_state)
     _render_slurm_state_panel(af3_folder)
@@ -741,10 +738,10 @@ def show_slurm_execution(project_path: str, af3_folder: str, pred_count: int):
     col1, col2 = st.columns(2)
 
     with col1:
-        num_jobs = st.number_input("Number of chunks (array tasks):", min_value=1, max_value=50,
+        num_jobs = st.number_input("Number of chunks (array tasks):", min_value=1, max_value=MAX_JOBS,
                                    value=int(cfg["default_jobs"]),
                                    help="Predictions are split evenly across this many array tasks.")
-        max_concurrent = st.number_input("Max tasks running at once:", min_value=1, max_value=50,
+        max_concurrent = st.number_input("Max tasks running at once:", min_value=1, max_value=MAX_JOBS,
                                          value=int(cfg["max_concurrent"]),
                                          help="sbatch --array=...%N. Keep low on shared storage.")
         cpus_options = list(cfg["cpus_options"])
@@ -777,7 +774,7 @@ def show_slurm_execution(project_path: str, af3_folder: str, pred_count: int):
                 status = check_job_status(job_id)
                 s = status['status']
                 icon = {"RUNNING": "🟢", "PENDING": "🟡", "COMPLETED": "✅",
-                        "FAILED": "❌"}.get(s, "⚪")
+                        "FAILED": "❌"}.get(s.split(":")[0], "⚪")
                 st.text(f"  {icon} Job array {job_id}: {s}")
 
     if st.button("Submit to SLURM", type="primary"):

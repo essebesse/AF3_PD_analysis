@@ -241,7 +241,7 @@ def show_detailed(project_path: str, af3_folder: str):
 
                 if confidences is not None:
                     chain_ids_resolved, chain_lengths_resolved = get_chain_info_from_confidences(confidences)
-                elif pred_format == 'alphapulldown':
+                elif _is_af2:
                     # No PAE/confidences — derive chain info from the PDB itself.
                     try:
                         import gemmi as _gemmi
@@ -303,10 +303,11 @@ def show_detailed(project_path: str, af3_folder: str):
                     if model_format == "pdb":
                         # AF2 relaxed PDBs carry explicit hydrogens (AF3 CIFs do
                         # not); drop them so the inlined viewer payload stays small.
+                        from core.af2_pae import HYDROGEN_ELEMENTS
                         cif_content = "\n".join(
                             ln for ln in cif_content.splitlines()
                             if not (ln.startswith(("ATOM", "HETATM"))
-                                    and ln[76:78].strip() in ("H", "D"))
+                                    and ln[76:78].strip() in HYDROGEN_ELEMENTS)
                         )
                     viewer_html = generate_viewer_html(
                         cif_content,
@@ -350,7 +351,7 @@ def show_detailed(project_path: str, af3_folder: str):
             with tab1:
                 st.markdown("### PAE Matrix Visualization")
 
-                if confidences is None and selected_pred.get('format') == 'alphapulldown':
+                if confidences is None and _is_af2:
                     st.info(
                         "**No PAE matrix for this AF2-multimer prediction.** "
                         "PAE plots need `ranked_N_PAE.csv` files next to `ranked_N.pdb`."
@@ -411,7 +412,7 @@ def show_detailed(project_path: str, af3_folder: str):
                     analyze_interface, analyze_interface_spatial, map_interface_regions,
                 )
 
-                _is_ap = selected_pred.get('format') == 'alphapulldown'
+                _is_ap = _is_af2 and confidences is None   # AF2 model without PAE
                 _can_full = cif_file.exists() and confidences is not None
                 _can_spatial = cif_file.exists() and _is_ap
 
@@ -736,7 +737,7 @@ def show_detailed(project_path: str, af3_folder: str):
                             file_name=f"{selected_pred_name}_s{seed}_m{sample}_pae_matrix.csv",
                             mime="text/csv"
                         )
-                elif selected_pred.get('format') == 'alphapulldown':
+                elif _is_af2:
                     st.caption("PAE matrix export needs ranked_N_PAE.csv files for AF2-multimer predictions.")
 
                 if cif_file.exists():

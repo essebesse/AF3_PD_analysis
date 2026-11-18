@@ -53,8 +53,13 @@ def af2_has_pae(work_dir: Path) -> bool:
     return af2_pae_file(work_dir, 0) is not None
 
 
+# Single definition of "hydrogen" for the whole app. CIFParser.atoms and the
+# AF2 atom_plddts list are aligned by position, so both must skip the same atoms.
+HYDROGEN_ELEMENTS = ("H", "D")
+
+
 def is_hydrogen(atom: "gemmi.Atom") -> bool:
-    return atom.element.name in ("H", "D")
+    return atom.element.name in HYDROGEN_ELEMENTS
 
 
 def load_af2_pae(pae_csv: Path) -> np.ndarray:

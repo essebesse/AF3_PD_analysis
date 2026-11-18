@@ -6,13 +6,14 @@ to analyze ALL models (not just top-ranked) in AF3 prediction directories.
 """
 
 import json
-import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 import re
 import gemmi
+
+from core.af2_pae import is_hydrogen
 
 
 def calculate_asymmetric_ipsae(pae_matrix: np.ndarray,
@@ -103,7 +104,7 @@ class CIFParser:
                 for atom in residue:
                     # AF3 CIFs have no hydrogens; AF2 relaxed PDBs do. Skip them
                     # so atom lists (and atom_plddts alignment) are heavy-atom only.
-                    if atom.element.name in ('H', 'D'):
+                    if is_hydrogen(atom):
                         continue
                     self.atoms.append({
                         'seq_id': seq_id,
@@ -535,7 +536,8 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
         top_only: If True, only analyze the top-ranked model.
     Returns list of analysis results, one per model.
     """
-    from core.scanner import resolve_prediction_dir, _is_af3_server_flat, _is_alphapulldown_format
+    from core.scanner import (resolve_prediction_dir, _is_af3_server_flat,
+                              _is_alphapulldown_format, af3_models_on_disk)
     pred_dir = resolve_prediction_dir(pred_dir)
 
     if _is_af3_server_flat(pred_dir):
@@ -571,25 +573,19 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
             top_pos = df.index[0]
         top_ranked = df.loc[top_pos]
 
+        top_seed, top_sample = int(top_ranked['seed']), int(top_ranked['sample'])
         rows = df.loc[[top_pos]] if top_only else df
-        on_disk = None
+        models = [{'seed': int(r['seed']), 'sample': int(r['sample']),
+                   'ranking_score': float(r['ranking_score']) if 'ranking_score' in df.columns else 0.0}
+                  for _, r in rows.iterrows()]
         if not top_only:
-            # Non-top models need their own seed-N_sample-M files; when those
-            # were deleted, load_confidences would fall back to the top-level
-            # (top model) files and report the top model under every label.
-            try:
-                on_disk = set(os.listdir(pred_dir))
-            except OSError:
-                on_disk = set()
-        for _, row in rows.iterrows():
-            seed = int(row['seed'])
-            sample = int(row['sample'])
-            is_top = (int(top_ranked['seed']) == seed and
-                      int(top_ranked['sample']) == sample)
-            if on_disk is not None and not is_top:
-                tag = f"seed-{seed}_sample-{sample}"
-                if tag not in on_disk and f"{prefix}_{tag}_confidences.json" not in on_disk:
-                    continue
+            # Skip models whose seed-N_sample-M files were deleted; otherwise
+            # load_confidences falls back to the top-level (top model) files
+            # and the top model is reported under every label.
+            models = af3_models_on_disk(pred_dir, models)
+        for m in models:
+            seed, sample = m['seed'], m['sample']
+            is_top = (seed == top_seed and sample == top_sample)
 
             result = analyze_sample(pred_dir, prefix, seed, sample, ipsae_pae_cutoff)
             if result:

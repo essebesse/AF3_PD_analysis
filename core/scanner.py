@@ -95,16 +95,21 @@ def _is_alphapulldown_format(d: Path) -> bool:
     return af2_work_dir(d) is not None
 
 
-def _af2_format(d: Path) -> str:
+def _af2_work_dir(d: Path) -> Optional[Path]:
+    from core.af2_pae import af2_work_dir
+    return af2_work_dir(d)
+
+
+def _af2_format(work_dir: Path) -> str:
     """'af2' when ranked_0_PAE.csv is present (full analysis), else
-    'alphapulldown' (no PAE). ``d`` must be an AF2 prediction folder."""
-    from core.af2_pae import af2_work_dir, af2_has_pae
-    wd = af2_work_dir(d)
-    return 'af2' if wd is not None and af2_has_pae(wd) else 'alphapulldown'
+    'alphapulldown' (no PAE). ``work_dir`` is the folder holding ranked_*.pdb."""
+    from core.af2_pae import af2_has_pae
+    return 'af2' if af2_has_pae(work_dir) else 'alphapulldown'
 
 
-def _af2_entry(d: Path) -> Dict:
-    """Scan entry for an AF2 prediction folder (``d`` itself, not ``d/seq``)."""
+def _af2_entry(d: Path, work_dir: Path) -> Dict:
+    """Scan entry for an AF2 prediction folder ``d`` (files in ``work_dir``,
+    which is ``d`` or ``d/seq``)."""
     pred_name = d.name
     match = re.match(r'(.+)_and_(.+)', pred_name)
     if match:
@@ -116,7 +121,7 @@ def _af2_entry(d: Path) -> Dict:
         'bait': bait_name,
         'prey': prey_name,
         'prediction_dir': str(d),
-        'format': _af2_format(d),
+        'format': _af2_format(work_dir),
     }
 
 
@@ -179,12 +184,13 @@ def find_af3_projects_recursive(root: str, max_depth: int = 6) -> List[Dict]:
             'format': 'server_flat',
         }]
     # Root itself is one AF2 prediction (ranked_*.pdb here or in seq/)
-    if _is_alphapulldown_format(root_path):
+    root_wd = _af2_work_dir(root_path)
+    if root_wd is not None:
         return [{
             'project_path': str(root_path),
             'af3_folder': str(root_path),
             'label': root_path.name,
-            'format': _af2_format(root_path),
+            'format': _af2_format(root_wd),
         }]
 
     def _walk(current: Path, depth: int):
@@ -210,13 +216,13 @@ def find_af3_projects_recursive(root: str, max_depth: int = 6) -> List[Dict]:
             # d is a single AF2 prediction whose files sit in d/seq/. (A flat
             # AlphaPulldown pair folder is found via its parent instead, so a
             # pulldown/ folder is listed once, not once per pair.)
-            if (d / "seq").is_dir() and _is_alphapulldown_format(d) \
-                    and not (d / "ranking_debug.json").is_file():
+            d_wd = _af2_work_dir(d)
+            if d_wd is not None and d_wd != d:
                 results.append({
                     'project_path': str(d),
                     'af3_folder': str(d),
                     'label': str(d.relative_to(root_path)),
-                    'format': _af2_format(d),
+                    'format': _af2_format(d_wd),
                 })
                 continue
 
@@ -348,7 +354,7 @@ def _load_server_flat_prediction(pred_dir: Path) -> Optional[Dict]:
         return None
 
 
-def _load_alphapulldown_prediction(pred_dir: Path) -> Optional[Dict]:
+def _load_alphapulldown_prediction(pred_dir: Path, work_dir: Optional[Path] = None) -> Optional[Dict]:
     """
     Load summary data for an AlphaPulldown (AF2-multimer) prediction.
 
@@ -358,8 +364,7 @@ def _load_alphapulldown_prediction(pred_dir: Path) -> Optional[Dict]:
     leave PAE-derived fields unset.
     """
     try:
-        from core.af2_pae import af2_work_dir
-        work_dir = af2_work_dir(pred_dir)
+        work_dir = work_dir or _af2_work_dir(pred_dir)
         if work_dir is None:
             return None
         rd_file = work_dir / "ranking_debug.json"
@@ -406,7 +411,7 @@ def _load_alphapulldown_prediction(pred_dir: Path) -> Optional[Dict]:
             'chain_ptm': [],
             'seed_samples': seed_samples,
             'prediction_dir': str(pred_dir),
-            'format': _af2_format(pred_dir),
+            'format': _af2_format(work_dir),
         }
     except Exception as e:
         print(f"Error loading AlphaPulldown prediction {pred_dir}: {e}")
@@ -429,8 +434,9 @@ def load_prediction_data(pred_dir: Path) -> Optional[Dict]:
             return _load_server_flat_prediction(pred_dir)
 
         # --- AlphaPulldown / AF2-multimer ---
-        if _is_alphapulldown_format(pred_dir):
-            return _load_alphapulldown_prediction(pred_dir)
+        af2_wd = _af2_work_dir(pred_dir)
+        if af2_wd is not None:
+            return _load_alphapulldown_prediction(pred_dir, af2_wd)
 
         # Find summary_confidences.json
         summary_file = pred_dir / f"{pred_name}_summary_confidences.json"
@@ -521,8 +527,9 @@ class AF3Scanner:
             return self.predictions
 
         # The folder itself is one AF2 prediction (ranked_*.pdb here or in seq/)
-        if _is_alphapulldown_format(self.af3_folder):
-            self.predictions.append(_af2_entry(self.af3_folder))
+        own_wd = _af2_work_dir(self.af3_folder)
+        if own_wd is not None:
+            self.predictions.append(_af2_entry(self.af3_folder, own_wd))
             return self.predictions
 
         for d in sorted(self.af3_folder.iterdir()):
@@ -551,8 +558,9 @@ class AF3Scanner:
                 continue
 
             # AF2-multimer (AlphaPulldown, or AF2 with PAE CSVs)
-            if _is_alphapulldown_format(resolved):
-                self.predictions.append(_af2_entry(resolved))
+            child_wd = _af2_work_dir(resolved)
+            if child_wd is not None:
+                self.predictions.append(_af2_entry(resolved, child_wd))
                 continue
 
             pred_name = resolved.name
