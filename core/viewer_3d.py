@@ -281,6 +281,17 @@ def generate_viewer_html(
         No confident interface residues detected (PAE &lt; 12 &#197; + distance &lt; 8 &#197;)
     </div>'''
 
+    # Controls hint overlay (so the click/hover interaction is discoverable)
+    controls_html = '''
+    <div style="position:absolute;top:8px;right:8px;background:rgba(255,255,255,0.92);
+        border-radius:6px;padding:6px 10px;font-family:Arial,sans-serif;font-size:11px;
+        color:#333;z-index:1000;box-shadow:0 1px 4px rgba(0,0,0,0.15);max-width:190px;">
+        <div style="font-weight:bold;margin-bottom:2px;">Controls</div>
+        <div>Drag&nbsp;= rotate &middot; scroll = zoom</div>
+        <div><b>Click a residue</b> to show its side chain</div>
+        <div>Click again to hide &middot; hover to identify</div>
+    </div>'''
+
     # Inline 3Dmol-min.js directly so we don't depend on Streamlit's static
     # file server being configured/enabled. The lru_cache means we pay the
     # 526 KB read once per process, not once per render.
@@ -307,6 +318,7 @@ def generate_viewer_html(
     </div>
     {legend_html}
     {no_iface_msg}
+    {controls_html}
 </div>
 <script>
 {inline_script}
@@ -316,7 +328,78 @@ def generate_viewer_html(
         document.getElementById("viewer_fallback").remove();
         var viewer = $3Dmol.createViewer("viewer", {{backgroundColor: "white"}});
         viewer.addModel({cif_escaped}, {_json.dumps(model_format)});
+
+        // Base (cartoon) styling — wrapped in a function so it can be re-applied
+        // whenever the selection changes, letting us add/remove side-chain
+        // sticks without losing the chain / PAE interface colors.
+        function setBaseStyles() {{
 {style_js}
+        }}
+
+        // --- Interactive residue selection (PyMOL/ProtView-style) -------------
+        // Click a residue -> show its side chain as sticks + a persistent label.
+        // Click again -> hide. Hover -> transient identification label.
+        var selected = {{}};     // key "chain|resi" -> {{chain,resi,x,y,z,text}}
+        var hoverEntry = null;   // transient hover label, or null
+
+        function atomKey(a) {{ return (a.chain || "") + "|" + a.resi; }}
+        function atomText(a) {{
+            return a.resn + " " + a.resi + (a.chain ? " (" + a.chain + ")" : "");
+        }}
+        function entryOf(a) {{
+            return {{chain: a.chain, resi: a.resi, x: a.x, y: a.y, z: a.z, text: atomText(a)}};
+        }}
+
+        function applyStyles() {{
+            setBaseStyles();
+            for (var k in selected) {{
+                var e = selected[k];
+                viewer.addStyle({{chain: e.chain, resi: e.resi}},
+                                {{stick: {{radius: 0.25, colorscheme: "default"}}}});
+            }}
+        }}
+
+        function applyLabels() {{
+            viewer.removeAllLabels();
+            for (var k in selected) {{
+                var e = selected[k];
+                viewer.addLabel(e.text, {{position: {{x: e.x, y: e.y, z: e.z}},
+                    backgroundColor: 0x1f2937, backgroundOpacity: 0.9,
+                    fontColor: "white", fontSize: 12, inFront: true}});
+            }}
+            if (hoverEntry && !selected[hoverEntry.key]) {{
+                viewer.addLabel(hoverEntry.text, {{position:
+                    {{x: hoverEntry.x, y: hoverEntry.y, z: hoverEntry.z}},
+                    backgroundColor: 0x111827, backgroundOpacity: 0.7,
+                    fontColor: "white", fontSize: 11, inFront: true}});
+            }}
+        }}
+
+        viewer.setClickable({{}}, true, function(atom) {{
+            if (!atom) return;
+            var k = atomKey(atom);
+            if (selected[k]) {{ delete selected[k]; }} else {{ selected[k] = entryOf(atom); }}
+            applyStyles();
+            applyLabels();
+            viewer.render();
+        }});
+
+        viewer.setHoverable({{}}, true,
+            function(atom) {{
+                if (!atom) return;
+                hoverEntry = entryOf(atom);
+                hoverEntry.key = atomKey(atom);
+                applyLabels();
+                viewer.render();
+            }},
+            function(atom) {{
+                hoverEntry = null;
+                applyLabels();
+                viewer.render();
+            }}
+        );
+
+        setBaseStyles();
         viewer.zoomTo();
         viewer.render();
     }} else {{

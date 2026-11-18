@@ -68,7 +68,14 @@ def check_job_status(job_id: str) -> Dict:
             timeout=30
         )
 
-        status = result.stdout.strip()
+        # A job array prints one line per task (or pending range): summarise.
+        states = [s.strip() for s in result.stdout.split('\n') if s.strip()]
+        if 'RUNNING' in states:
+            status = 'RUNNING'
+        elif 'PENDING' in states:
+            status = 'PENDING'
+        else:
+            status = states[0] if states else ''
 
         if status == 'RUNNING':
             return {'status': 'RUNNING', 'running': True, 'completed': False}

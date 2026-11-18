@@ -109,13 +109,16 @@ def show_analyze(project_path: str, af3_folder: str):
 
     st.divider()
 
-    tab_local, tab_slurm = st.tabs(["🖥️ Local (this machine)", "🖧 SLURM Cluster"])
-
-    with tab_local:
+    # The SLURM tab only appears on machines where sbatch is available.
+    from core.slurm_config import slurm_available
+    if slurm_available():
+        tab_local, tab_slurm = st.tabs(["🖥️ Local (this machine)", "🖧 SLURM Cluster"])
+        with tab_local:
+            show_local_execution(project_path, af3_folder, pred_count, dominant_format)
+        with tab_slurm:
+            show_slurm_execution(project_path, af3_folder, pred_count)
+    else:
         show_local_execution(project_path, af3_folder, pred_count, dominant_format)
-
-    with tab_slurm:
-        show_slurm_execution(project_path, af3_folder, pred_count)
 
 
 def _format_duration(seconds: float) -> str:
@@ -720,75 +723,94 @@ def _cleanup_slurm_scratch(af3_folder: str):
 
 def show_slurm_execution(project_path: str, af3_folder: str, pred_count: int):
     """Display SLURM cluster submission options."""
+    from core.slurm_config import load_slurm_config, CONFIG_FILE
 
     # Always-visible folder-driven run-state panel (works without session_state)
     _render_slurm_state_panel(af3_folder)
 
-    st.markdown("""
-    Submit analysis to the CPU cluster (vader nodes). The predictions will be
-    split into chunks and distributed across multiple SLURM jobs.
-    """)
+    cfg = load_slurm_config()
+    st.markdown(
+        "Split the predictions into chunks and submit them as one SLURM job array. "
+        f"Partition, QOS, account and environment come from `{CONFIG_FILE.name}` "
+        "in the app folder (see `slurm_config.example.toml`)."
+    )
+
+    def _idx(options, value):
+        return options.index(value) if value in options else 0
 
     col1, col2 = st.columns(2)
 
     with col1:
-        num_jobs = st.number_input("Number of SLURM jobs:", min_value=1, max_value=50,
-                                   value=6,
-                                   help="Predictions will be split evenly across this many jobs (6 = one per vader node)")
-        cpus_per_job = st.selectbox("CPUs per job:", [32, 48, 64, 72], index=2)
-        memory = st.selectbox("Memory per job:", ["64G", "128G", "256G"], index=1)
+        num_jobs = st.number_input("Number of chunks (array tasks):", min_value=1, max_value=50,
+                                   value=int(cfg["default_jobs"]),
+                                   help="Predictions are split evenly across this many array tasks.")
+        max_concurrent = st.number_input("Max tasks running at once:", min_value=1, max_value=50,
+                                         value=int(cfg["max_concurrent"]),
+                                         help="sbatch --array=...%N. Keep low on shared storage.")
+        cpus_options = list(cfg["cpus_options"])
+        cpus_per_job = st.selectbox("CPUs per task:", cpus_options,
+                                    index=_idx(cpus_options, cfg["default_cpus"]))
+        memory_options = list(cfg["memory_options"])
+        memory = st.selectbox("Memory per task:", memory_options,
+                              index=_idx(memory_options, cfg["default_memory"]))
 
     with col2:
         pae_cutoff = st.slider("PAE cutoff (Å):", 5.0, 15.0, 10.0, 0.5, key="slurm_pae")
         analyze_all = st.checkbox("Analyze all 5 models per prediction", value=False, key="slurm_all_models",
                                    help="Default: top-ranked model only.")
-        qos = "normal"
+        shown = {k: cfg[k] for k in ("partition", "qos", "account", "time") if cfg[k]}
+        st.caption("SLURM options: " + (", ".join(f"{k}={v}" for k, v in shown.items())
+                                        or "cluster defaults"))
 
     preds_per_job = (pred_count + num_jobs - 1) // num_jobs if num_jobs > 0 else pred_count
-    st.caption(f"~{preds_per_job} predictions per job, {cpus_per_job} CPUs each")
+    st.caption(f"~{preds_per_job} predictions per task, {cpus_per_job} CPUs each, "
+               f"at most {max_concurrent} running at once")
 
     st.divider()
 
-    # Per-job squeue/sacct detail — only when we have job IDs from this session
+    # Cluster status — only when we have a job ID from this session
     if st.session_state.get('slurm_job_ids'):
         from core.slurm_manager import check_job_status
 
-        with st.expander("Per-job cluster status (squeue / sacct)", expanded=False):
+        with st.expander("Cluster status (squeue / sacct)", expanded=False):
             for job_id in st.session_state['slurm_job_ids']:
                 status = check_job_status(job_id)
                 s = status['status']
                 icon = {"RUNNING": "🟢", "PENDING": "🟡", "COMPLETED": "✅",
                         "FAILED": "❌"}.get(s, "⚪")
-                st.text(f"  {icon} Job {job_id}: {s}")
+                st.text(f"  {icon} Job array {job_id}: {s}")
 
-    # Submit button
     if st.button("Submit to SLURM", type="primary"):
-        submit_slurm_jobs(af3_folder, num_jobs, cpus_per_job, memory, qos,
-                          pae_cutoff, analyze_all)
+        submit_slurm_jobs(af3_folder, int(num_jobs), cpus_per_job, memory,
+                          pae_cutoff, analyze_all, int(max_concurrent), cfg)
+
+
+def _sh_quote(s: str) -> str:
+    """Quote for embedding inside single quotes in a shell script."""
+    return str(s).replace("'", "'\\''")
 
 
 def submit_slurm_jobs(af3_folder: str, num_jobs: int, cpus_per_job: int,
-                       memory: str, qos: str, pae_cutoff: float, analyze_all: bool):
-    """Split predictions into chunks and submit SLURM jobs."""
-    import json
-
-    from core.scanner import resolve_prediction_dir
+                      memory: str, pae_cutoff: float, analyze_all: bool,
+                      max_concurrent: int, cfg: dict):
+    """Split predictions into chunks and submit them as one SLURM job array."""
+    from core.scanner import AF3Scanner
+    from core.slurm_manager import submit_job
 
     app_dir = str(Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     af3_path = Path(af3_folder)
 
-    # List all prediction directories (resolve AF3 Server nesting)
-    pred_dirs = sorted([
-        str(resolve_prediction_dir(d)) for d in af3_path.iterdir()
-        if d.is_dir() and not d.name.startswith('seed-') and not d.name.startswith('.')
-    ])
+    # Same prediction list as the local runner (handles all input formats)
+    try:
+        pred_dirs = sorted(p['prediction_dir'] for p in AF3Scanner(af3_path).scan())
+    except Exception as e:
+        st.error(f"Could not list predictions: {e}")
+        return
     total = len(pred_dirs)
-
     if total == 0:
         st.error("No prediction directories found.")
         return
 
-    # Split into chunks
     chunk_size = (total + num_jobs - 1) // num_jobs
     chunks = [pred_dirs[i:i + chunk_size] for i in range(0, total, chunk_size)]
 
@@ -806,69 +828,55 @@ def submit_slurm_jobs(af3_folder: str, num_jobs: int, cpus_per_job: int,
     if n_removed > 0:
         st.info(f"Cleared {n_removed} SLURM scratch file(s) from a previous run.")
 
-    # Write chunk lists and generate SLURM scripts
-    from core.slurm_manager import submit_job
-
-    partition = "cpu"
-    venv_activate = f"{app_dir}/.venv/bin/activate"
-
-    job_ids = []
     for i, chunk in enumerate(chunks):
-        # Write chunk file listing the prediction folder names
-        chunk_file = af3_path / f"_slurm_chunk_{i}.txt"
-        with open(chunk_file, 'w') as f:
+        with open(af3_path / f"_slurm_chunk_{i}.txt", 'w') as f:
             f.write('\n'.join(chunk))
 
-        output_file = af3_path / f"_slurm_results_{i}.json"
-        job_name = f"AF3app_{Path(af3_folder).name}_chunk{i}"
+    esc_af3 = _sh_quote(af3_folder)
+    job_name = f"AF3app_{af3_path.name}"
+    header = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name={job_name}",
+        "#SBATCH --nodes=1",
+        "#SBATCH --ntasks=1",
+        f"#SBATCH --cpus-per-task={cpus_per_job}",
+        f"#SBATCH --mem={memory}",
+        f"#SBATCH --array=0-{len(chunks) - 1}%{max_concurrent}",
+        f"#SBATCH --output='{esc_af3}/AF3_app_chunk%a_%A.log'",
+        f"#SBATCH --error='{esc_af3}/AF3_app_chunk%a_%A.err'",
+    ]
+    for key in ("partition", "qos", "account", "time"):
+        if cfg.get(key):
+            header.append(f"#SBATCH --{key}={cfg[key]}")
+    header += [str(line) for line in cfg.get("extra_lines", [])]
 
-        # Escape paths for safe embedding in shell single-quoted strings
-        esc_chunk = str(chunk_file).replace("'", "'\\''")
-        esc_af3 = str(af3_folder).replace("'", "'\\''")
-        esc_output = str(output_file).replace("'", "'\\''")
-        esc_venv = venv_activate.replace("'", "'\\''")
-        esc_app = app_dir.replace("'", "'\\''")
+    script = "\n".join(header) + f"""
 
-        script = f"""#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task={cpus_per_job}
-#SBATCH --mem={memory}
-#SBATCH --time=23:59:59
-#SBATCH --qos={qos}
-#SBATCH --partition={partition}
-#SBATCH --output='{esc_af3}/AF3_app_chunk{i}_%j.log'
-#SBATCH --error='{esc_af3}/AF3_app_chunk{i}_%j.err'
-
-echo "AF3 Analysis App - Chunk {i+1}/{len(chunks)}"
-echo "Job ID: $SLURM_JOB_ID | Node: $SLURMD_NODENAME | CPUs: $SLURM_CPUS_PER_TASK"
-echo "Predictions in chunk: {len(chunk)}"
+I=$SLURM_ARRAY_TASK_ID
+echo "AF3 Analysis App - chunk $I of {len(chunks)} (array job $SLURM_ARRAY_JOB_ID)"
+echo "Node: $SLURMD_NODENAME | CPUs: $SLURM_CPUS_PER_TASK"
 echo "Start: $(date)"
 
-source '{esc_venv}'
-cd '{esc_app}'
+{cfg['env_setup']}
+cd '{_sh_quote(app_dir)}'
 
 # Pass paths via environment variables to avoid shell/Python quoting issues
-export AF3_CHUNK_FILE='{esc_chunk}'
-export AF3_FOLDER='{esc_af3}'
-export AF3_OUTPUT_FILE='{esc_output}'
+export AF3_CHUNK_FILE='{esc_af3}'/_slurm_chunk_$I.txt
+export AF3_OUTPUT_FILE='{esc_af3}'/_slurm_results_$I.json
 
 python << 'PYEOF'
-import json, sys, os
+import json, os
 from pathlib import Path
 from multiprocessing import Pool
 from functools import partial
 from core.analyzer import analyze_prediction_all_models
 
 chunk_file = os.environ["AF3_CHUNK_FILE"]
-af3_folder = os.environ["AF3_FOLDER"]
 output_file = os.environ["AF3_OUTPUT_FILE"]
 
 with open(chunk_file) as f:
-    pred_paths = [line.strip() for line in f if line.strip()]
+    pred_dirs = [Path(line.strip()) for line in f if line.strip()]
 
-pred_dirs = [Path(p) for p in pred_paths]
 print(f"Analyzing {{len(pred_dirs)}} predictions with {cpus_per_job} CPUs...")
 
 analyze_fn = partial(analyze_prediction_all_models,
@@ -902,29 +910,34 @@ PYEOF
 
 echo "Finished: $(date)"
 """
-        result = submit_job(script, af3_folder)
-        if result['success']:
-            job_ids.append(result['job_id'])
-            st.success(f"Chunk {i+1}/{len(chunks)}: submitted job {result['job_id']} ({len(chunk)} predictions)")
-        else:
-            st.error(f"Chunk {i+1} failed: {result['error']}")
+    result = submit_job(script, af3_folder)
+    if not result['success']:
+        st.error(f"Submission failed: {result['error']}")
+        return
 
-    if job_ids:
-        st.session_state['slurm_job_ids'] = job_ids
-        st.session_state['slurm_num_chunks'] = len(chunks)
-        # Clear any stale merge marker from previous SLURM runs in this session
-        st.session_state.pop('_slurm_merge_attempted_for', None)
-        st.info(f"Submitted {len(job_ids)} jobs. Check progress with the command below.")
-        st.code(f"squeue -u $USER | grep AF3app", language="bash")
-        # Re-render the page so the folder-state panel above picks up the
-        # newly-written chunk files and starts the 30 s auto-refresh.
-        # Without this rerun the panel stays on its pre-submit state and
-        # never injects the auto-refresh JS, leaving the user stuck.
-        st.rerun()
+    st.session_state['slurm_job_ids'] = [result['job_id']]
+    st.session_state['slurm_num_chunks'] = len(chunks)
+    # Clear any stale merge marker from previous SLURM runs in this session
+    st.session_state.pop('_slurm_merge_attempted_for', None)
+    st.success(f"Submitted job array {result['job_id']}: {len(chunks)} chunks, "
+               f"at most {max_concurrent} running at once.")
+    st.code("squeue -u $USER | grep AF3app", language="bash")
+    # Re-render so the folder-state panel above picks up the newly-written
+    # chunk files and shows the "chunks running / click Refresh" prompt.
+    st.rerun()
 
 
 def merge_slurm_results(af3_folder: str, num_chunks: int):
-    """Merge chunk result files into the final analysis cache."""
+    """Merge chunk result files into the final analysis cache.
+
+    SLURM workers write per-prediction ``af3_app_analysis.json`` files
+    inline as they finish (see ``submit_slurm_jobs``). This merge only
+    assembles the combined cache and backfills the rare per-prediction
+    file the workers happened to skip — it does NOT re-write files the
+    workers already produced. The old re-write pass was single-threaded
+    in the Streamlit process and dominated wall-clock on networked
+    storage for large folders.
+    """
     import json
 
     af3_path = Path(af3_folder)
@@ -948,10 +961,9 @@ def merge_slurm_results(af3_folder: str, num_chunks: int):
 
     st.text(f"  Saved {len(all_results)} models to {cache_file.name}")
 
-    # Save per-prediction JSON files for fast lookup in Detailed Analysis.
-    # On networked storage these many-tiny-file writes are I/O-bound; we
-    # skip the slow resolve_prediction_dir() call when no AF3 Server-style
-    # nesting exists in this folder, and we batch-update progress.
+    # Backfill any per-prediction file the worker skipped. The fast path
+    # is one stat() per prediction (existence check) — anything missing
+    # is rare and gets written here.
     from collections import defaultdict
     from core.scanner import resolve_prediction_dir
     by_pred = defaultdict(list)
@@ -959,36 +971,32 @@ def merge_slurm_results(af3_folder: str, num_chunks: int):
         by_pred[r.get('prediction_name', '')].append(r)
 
     pred_names = [k for k in by_pred if k]
-    total = len(pred_names)
 
-    # Detect AF3 Server <name>/<name>/ nesting once; if absent we can skip
-    # the per-iteration iterdir() call inside resolve_prediction_dir.
+    # Detect AF3 Server <name>/<name>/ nesting once so the existence
+    # check below can skip resolve_prediction_dir's iterdir() when absent.
     needs_resolve = any(
         (af3_path / p).is_dir() and (af3_path / p / p).is_dir()
         for p in pred_names[:5]   # cheap sample
     )
 
-    progress = st.progress(0, text=f"Writing per-prediction files... 0/{total}")
-    n_pred_files = 0
-    update_every = max(1, total // 50)  # ~50 progress updates total
-    for idx, pred_name in enumerate(pred_names):
+    n_backfilled = 0
+    for pred_name in pred_names:
         if needs_resolve:
             target_dir = resolve_prediction_dir(af3_path / pred_name)
         else:
             target_dir = af3_path / pred_name
         pred_json = target_dir / "af3_app_analysis.json"
+        if pred_json.exists():
+            continue   # worker already wrote it
         try:
             with open(pred_json, 'w') as pf:
-                json.dump(by_pred[pred_name], pf)  # no indent — faster
-            n_pred_files += 1
-        except Exception:
+                json.dump(by_pred[pred_name], pf)
+            n_backfilled += 1
+        except OSError:
             pass
-        if idx % update_every == 0 or idx == total - 1:
-            progress.progress((idx + 1) / total,
-                              text=f"Writing per-prediction files... {idx + 1}/{total}")
-    progress.empty()
 
-    st.text(f"  Saved {n_pred_files} per-prediction JSON files")
+    if n_backfilled:
+        st.text(f"  Backfilled {n_backfilled} per-prediction JSON file(s) the worker skipped")
 
     # Clean up chunk files
     for i in range(num_chunks):

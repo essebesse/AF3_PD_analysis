@@ -213,7 +213,7 @@ def plot_pae_interface_zoom(pae_matrix: np.ndarray,
 
     if len(rows_6) > 0:
         ax.scatter(cols_6, rows_6, marker='*', s=15, c='orange', alpha=0.8,
-                   edgecolors='none', label=f'PAE < {pae_cutoff:.0f}Å ({len(rows_6)})')
+                   edgecolors='none', label=f'3 ≤ PAE < {pae_cutoff:.0f}Å ({len(rows_6)})')
     if len(rows_3) > 0:
         ax.scatter(cols_3, rows_3, marker='*', s=25, c='red', alpha=0.9,
                    edgecolors='none', label=f'PAE < 3Å ({len(rows_3)})')

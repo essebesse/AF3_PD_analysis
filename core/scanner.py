@@ -6,6 +6,7 @@ Scan = list folders. Data loaded only when needed.
 """
 
 import csv
+import os
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -31,6 +32,31 @@ def resolve_prediction_dir(d: Path) -> Path:
         if has_seeds or has_ranking or has_summary:
             return inner
     return d
+
+
+def af3_models_on_disk(pred_dir: Path, seed_samples: List[Dict]) -> List[Dict]:
+    """Keep only the (seed, sample) rows whose per-model files exist, plus the
+    top-ranked row (whose files are the top-level ones).
+
+    AF3 lists all models in ranking_scores.csv, but the seed-N_sample-M/
+    folders are often deleted to save space. Without this filter the
+    top-level (top model) files would be reused for every row. One directory
+    listing per call.
+    """
+    if not seed_samples or 'ranking_score' not in seed_samples[0]:
+        return seed_samples
+    try:
+        names = set(os.listdir(pred_dir))
+    except OSError:
+        return seed_samples
+    prefix = pred_dir.name
+    top = max(seed_samples, key=lambda ss: float(ss['ranking_score']))
+    kept = []
+    for ss in seed_samples:
+        tag = f"seed-{ss['seed']}_sample-{ss['sample']}"
+        if ss is top or tag in names or f"{prefix}_{tag}_confidences.json" in names:
+            kept.append(ss)
+    return kept
 
 
 def _is_af3_server_flat(d: Path) -> bool:
@@ -60,20 +86,38 @@ def _is_af3_server_flat(d: Path) -> bool:
 
 def _is_alphapulldown_format(d: Path) -> bool:
     """
-    Detect AlphaPulldown (AlphaFold 2 multimer) output format.
+    Detect AF2-multimer output (AlphaPulldown or AF2 with PAE CSVs).
 
-    AlphaPulldown produces ``ranked_<N>.pdb`` files (typically 0..4) plus
-    ``ranking_debug.json`` (with ``iptm+ptm`` scores) directly inside the
-    prediction folder. No PAE matrix is available — analysis is therefore
-    limited to combined iptm+ptm, spatial interface contacts, and
-    per-residue pLDDT from PDB B-factors.
+    ``ranked_<N>.pdb`` + ``ranking_debug.json`` either directly in ``d`` or in
+    ``d/seq``. See ``core/af2_pae.py`` for the two flavours.
     """
-    try:
-        if not (d / "ranking_debug.json").is_file():
-            return False
-        return (d / "ranked_0.pdb").is_file()
-    except (PermissionError, OSError):
-        return False
+    from core.af2_pae import af2_work_dir
+    return af2_work_dir(d) is not None
+
+
+def _af2_format(d: Path) -> str:
+    """'af2' when ranked_0_PAE.csv is present (full analysis), else
+    'alphapulldown' (no PAE). ``d`` must be an AF2 prediction folder."""
+    from core.af2_pae import af2_work_dir, af2_has_pae
+    wd = af2_work_dir(d)
+    return 'af2' if wd is not None and af2_has_pae(wd) else 'alphapulldown'
+
+
+def _af2_entry(d: Path) -> Dict:
+    """Scan entry for an AF2 prediction folder (``d`` itself, not ``d/seq``)."""
+    pred_name = d.name
+    match = re.match(r'(.+)_and_(.+)', pred_name)
+    if match:
+        bait_name, prey_name = match.group(1), match.group(2)
+    else:
+        bait_name, prey_name = pred_name, ""
+    return {
+        'name': pred_name,
+        'bait': bait_name,
+        'prey': prey_name,
+        'prediction_dir': str(d),
+        'format': _af2_format(d),
+    }
 
 
 def _dir_has_predictions(d: Path) -> bool:
@@ -134,6 +178,14 @@ def find_af3_projects_recursive(root: str, max_depth: int = 6) -> List[Dict]:
             'label': root_path.name,
             'format': 'server_flat',
         }]
+    # Root itself is one AF2 prediction (ranked_*.pdb here or in seq/)
+    if _is_alphapulldown_format(root_path):
+        return [{
+            'project_path': str(root_path),
+            'af3_folder': str(root_path),
+            'label': root_path.name,
+            'format': _af2_format(root_path),
+        }]
 
     def _walk(current: Path, depth: int):
         if depth > max_depth:
@@ -154,6 +206,19 @@ def find_af3_projects_recursive(root: str, max_depth: int = 6) -> List[Dict]:
                     'format': 'server_flat',
                 })
                 continue  # don't descend further
+
+            # d is a single AF2 prediction whose files sit in d/seq/. (A flat
+            # AlphaPulldown pair folder is found via its parent instead, so a
+            # pulldown/ folder is listed once, not once per pair.)
+            if (d / "seq").is_dir() and _is_alphapulldown_format(d) \
+                    and not (d / "ranking_debug.json").is_file():
+                results.append({
+                    'project_path': str(d),
+                    'af3_folder': str(d),
+                    'label': str(d.relative_to(root_path)),
+                    'format': _af2_format(d),
+                })
+                continue
 
             # Check if d/AF3/ is a predictions folder
             af3_sub = d / "AF3"
@@ -293,9 +358,11 @@ def _load_alphapulldown_prediction(pred_dir: Path) -> Optional[Dict]:
     leave PAE-derived fields unset.
     """
     try:
-        rd_file = pred_dir / "ranking_debug.json"
-        if not rd_file.is_file():
+        from core.af2_pae import af2_work_dir
+        work_dir = af2_work_dir(pred_dir)
+        if work_dir is None:
             return None
+        rd_file = work_dir / "ranking_debug.json"
         with open(rd_file, 'r') as f:
             rd = json.load(f)
 
@@ -339,7 +406,7 @@ def _load_alphapulldown_prediction(pred_dir: Path) -> Optional[Dict]:
             'chain_ptm': [],
             'seed_samples': seed_samples,
             'prediction_dir': str(pred_dir),
-            'format': 'alphapulldown',
+            'format': _af2_format(pred_dir),
         }
     except Exception as e:
         print(f"Error loading AlphaPulldown prediction {pred_dir}: {e}")
@@ -453,6 +520,11 @@ class AF3Scanner:
             })
             return self.predictions
 
+        # The folder itself is one AF2 prediction (ranked_*.pdb here or in seq/)
+        if _is_alphapulldown_format(self.af3_folder):
+            self.predictions.append(_af2_entry(self.af3_folder))
+            return self.predictions
+
         for d in sorted(self.af3_folder.iterdir()):
             if not d.is_dir() or d.name.startswith('seed-') or d.name.startswith('.'):
                 continue
@@ -478,21 +550,9 @@ class AF3Scanner:
                 })
                 continue
 
-            # AlphaPulldown / AF2-multimer
+            # AF2-multimer (AlphaPulldown, or AF2 with PAE CSVs)
             if _is_alphapulldown_format(resolved):
-                pred_name = resolved.name
-                match = re.match(r'(.+)_and_(.+)', pred_name)
-                if match:
-                    bait_name, prey_name = match.group(1), match.group(2)
-                else:
-                    bait_name, prey_name = pred_name, ""
-                self.predictions.append({
-                    'name': pred_name,
-                    'bait': bait_name,
-                    'prey': prey_name,
-                    'prediction_dir': str(resolved),
-                    'format': 'alphapulldown',
-                })
+                self.predictions.append(_af2_entry(resolved))
                 continue
 
             pred_name = resolved.name

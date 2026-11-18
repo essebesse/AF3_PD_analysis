@@ -133,11 +133,11 @@ def show_detailed(project_path: str, af3_folder: str):
     # so PAE plots, ipSAE, and PAE-filtered contacts are not available.
     if selected_pred.get('format') == 'alphapulldown':
         st.warning(
-            "**AlphaPulldown / AF2-multimer prediction.** "
-            "Detailed PAE analysis is not available for this format — AF2-multimer "
-            "output does not include the per-residue PAE matrix. "
-            "Available: 3D structure (PDB), spatial Cβ–Cβ interface contacts, "
-            "interface pLDDT (from B-factors), hub residues, and PyMOL/contacts export. "
+            "**AF2-multimer prediction without PAE files.** "
+            "No `ranked_N_PAE.csv` files were found (AlphaPulldown keeps the PAE "
+            "matrix only inside its `result_*.pkl` files, which the app does not read). "
+            "Available: 3D structure, spatial Cβ–Cβ interface contacts, "
+            "interface pLDDT (from B-factors), hub residues, PyMOL/contacts export. "
             "Not available: ipSAE, PAE plots, PAE-filtered contacts, PAE matrix export."
         )
 
@@ -146,6 +146,14 @@ def show_detailed(project_path: str, af3_folder: str):
     # Model selector within prediction
     st.subheader("🎲 Select Model")
     seed_samples = selected_pred.get('seed_samples', [])
+    if selected_pred.get('format', 'af3') == 'af3' and selected_pred.get('prediction_dir'):
+        # Drop models whose seed-N_sample-M files were deleted (see scanner)
+        from core.scanner import af3_models_on_disk
+        n_listed = len(seed_samples)
+        seed_samples = af3_models_on_disk(Path(selected_pred['prediction_dir']), seed_samples)
+        if len(seed_samples) < n_listed:
+            st.caption(f"{n_listed - len(seed_samples)} of {n_listed} models are listed in "
+                       "ranking_scores.csv but their seed/sample files are not on disk.")
 
     if seed_samples:
         # Find top-ranked model (highest ranking score)
@@ -196,6 +204,12 @@ def show_detailed(project_path: str, af3_folder: str):
             from core.viewer_3d import generate_viewer_html, compute_interface_pae_per_residue
 
             pred_dir = Path(selected_pred['prediction_dir'])
+            # AF2 ranked_N.pdb may sit in pred_dir/seq/
+            _is_af2 = selected_pred.get('format') in ('alphapulldown', 'af2')
+            struct_dir = pred_dir
+            if _is_af2:
+                from core.af2_pae import af2_work_dir
+                struct_dir = af2_work_dir(pred_dir) or pred_dir
 
             # ── Compute everything ONCE per model, store in session state ──
             model_key = f"{selected_pred_name}_{seed}_{sample}"
@@ -232,7 +246,7 @@ def show_detailed(project_path: str, af3_folder: str):
                     try:
                         import gemmi as _gemmi
                         _structure = _gemmi.read_structure(str(
-                            pred_dir / f"ranked_{sample}.pdb"
+                            struct_dir / f"ranked_{sample}.pdb"
                         ))
                         if len(_structure) > 0:
                             _model = _structure[0]
@@ -251,7 +265,11 @@ def show_detailed(project_path: str, af3_folder: str):
                     for i, cid in enumerate(chain_ids_resolved):
                         if i < len(accs):
                             acc = accs[i]
-                            name = gene_cache.get(acc, acc)
+                            # gene_cache stores '' for accessions UniProt could
+                            # not resolve, so .get(acc, acc) would yield '' (the
+                            # default only fires when the key is absent). Fall
+                            # back to the accession when the gene name is empty.
+                            name = gene_cache.get(acc) or acc
                             protein_names.append(name)
                         else:
                             protein_names.append(cid)
@@ -263,7 +281,7 @@ def show_detailed(project_path: str, af3_folder: str):
                     sample_dir / f"{selected_pred_name}_seed-{seed}_sample-{sample}_model.cif",
                     sample_dir / "model.cif",
                     pred_dir / f"{selected_pred_name}_model_{sample}.cif",  # AF3 Server flat
-                    pred_dir / f"ranked_{sample}.pdb",                       # AlphaPulldown
+                    struct_dir / f"ranked_{sample}.pdb",                       # AlphaPulldown
                     pred_dir / f"{selected_pred_name}_model.cif",
                     pred_dir / "model.cif",
                 ]
@@ -282,6 +300,14 @@ def show_detailed(project_path: str, af3_folder: str):
                 if cif_file.exists():
                     cif_content = cif_file.read_text()
                     model_format = "pdb" if cif_file.suffix.lower() == ".pdb" else "cif"
+                    if model_format == "pdb":
+                        # AF2 relaxed PDBs carry explicit hydrogens (AF3 CIFs do
+                        # not); drop them so the inlined viewer payload stays small.
+                        cif_content = "\n".join(
+                            ln for ln in cif_content.splitlines()
+                            if not (ln.startswith(("ATOM", "HETATM"))
+                                    and ln[76:78].strip() in ("H", "D"))
+                        )
                     viewer_html = generate_viewer_html(
                         cif_content,
                         pae_residue_data=pae_data,
@@ -326,10 +352,8 @@ def show_detailed(project_path: str, af3_folder: str):
 
                 if confidences is None and selected_pred.get('format') == 'alphapulldown':
                     st.info(
-                        "**Not available for AlphaPulldown (AF2-multimer) output.** "
-                        "AF2-multimer predictions only include the rendered PAE PNGs that "
-                        "AlphaPulldown writes alongside `ranked_*.pdb` — there is no PAE "
-                        "matrix to plot interactively in this workflow."
+                        "**No PAE matrix for this AF2-multimer prediction.** "
+                        "PAE plots need `ranked_N_PAE.csv` files next to `ranked_N.pdb`."
                     )
                 elif confidences is not None:
                     pae_matrix = np.array(confidences.get('pae', []))
@@ -451,8 +475,17 @@ def show_detailed(project_path: str, af3_folder: str):
 
                         # Show top contacts table with protein names as column headers
                         contact_df = pd.DataFrame(contacts[:50])  # Show top 50
-                        name_a = protein_names[0] if len(protein_names) > 0 else "Chain A"
-                        name_b = protein_names[1] if len(protein_names) > 1 else "Chain B"
+                        # Header stems must be distinct: empty names fall back to
+                        # "Chain A/B", and identical labels (e.g. homodimers) get
+                        # a chain-ID suffix, so the renamed DataFrame never has
+                        # duplicate column names (which st.dataframe rejects).
+                        name_a = (protein_names[0] if len(protein_names) > 0 else "") or "Chain A"
+                        name_b = (protein_names[1] if len(protein_names) > 1 else "") or "Chain B"
+                        if name_a == name_b:
+                            cid_a = chain_ids_resolved[0] if len(chain_ids_resolved) > 0 else "A"
+                            cid_b = chain_ids_resolved[1] if len(chain_ids_resolved) > 1 else "B"
+                            name_a = f"{name_a} ({cid_a})"
+                            name_b = f"{name_b} ({cid_b})"
                         col_rename = {
                             'chain_a_res': f'{name_a} res',
                             'chain_b_res': f'{name_b} res',
@@ -556,7 +589,7 @@ def show_detailed(project_path: str, af3_folder: str):
 
                     # Per-model iPTM/PTM. AlphaPulldown stores combined iptm+ptm
                     # directly on seed_samples; AF3 needs load_summary.
-                    if ss.get('iptm') is not None and selected_pred.get('format') == 'alphapulldown':
+                    if ss.get('iptm') is not None and _is_af2:
                         model_iptm = ss['iptm']
                         model_ptm = ss.get('ptm', model_iptm)
                     else:
@@ -583,7 +616,7 @@ def show_detailed(project_path: str, af3_folder: str):
                 if not _show_pae_comparison:
                     st.caption(
                         "PAE matrix side-by-side comparison is not available for "
-                        "AlphaPulldown (AF2-multimer) — no PAE matrix in this output."
+                        "AF2-multimer predictions without ranked_N_PAE.csv files."
                     )
 
                 comp_plot_key = f"_comp_plot_{selected_pred_name}"
@@ -704,7 +737,7 @@ def show_detailed(project_path: str, af3_folder: str):
                             mime="text/csv"
                         )
                 elif selected_pred.get('format') == 'alphapulldown':
-                    st.caption("PAE matrix export is not available for AlphaPulldown (no PAE in AF2-multimer output).")
+                    st.caption("PAE matrix export needs ranked_N_PAE.csv files for AF2-multimer predictions.")
 
                 if cif_file.exists():
                     iface_key = f"_iface_{model_key}"

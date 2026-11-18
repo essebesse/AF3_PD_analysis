@@ -35,3 +35,11 @@ AF3_Analysis_App_User_Manual.txt
 
 # Alternative venv directory name
 venv/
+
+# Site-specific SLURM settings (template: slurm_config.example.toml)
+slurm_config.toml
+
+# SLURM scratch written into prediction folders
+_slurm_chunk_*.txt
+_slurm_results_*.json
+af3_app_analysis.json

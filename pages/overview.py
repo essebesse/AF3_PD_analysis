@@ -132,10 +132,10 @@ def show_load_data(project_path: str, af3_folder: str):
 
             missing_accs = [acc for acc in unique_accs if acc not in gene_cache]
             if missing_accs:
-                st.info(f"Fetching gene names for {len(missing_accs)} proteins...")
                 from core.utils import fetch_gene_names_batch
                 try:
-                    new_genes = fetch_gene_names_batch(missing_accs)
+                    with st.spinner(f"Fetching gene names for {len(missing_accs)} proteins from UniProt..."):
+                        new_genes = fetch_gene_names_batch(missing_accs)
                     gene_cache.update(new_genes)
                 except Exception:
                     st.warning("Could not fetch gene names from UniProt.")

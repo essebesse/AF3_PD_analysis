@@ -141,7 +141,8 @@ def show_results(project_path: str, af3_folder: str):
     if missing_accs:
         from core.utils import fetch_gene_names_batch
         try:
-            new_genes = fetch_gene_names_batch(missing_accs)
+            with st.spinner(f"Fetching gene names for {len(missing_accs)} proteins from UniProt..."):
+                new_genes = fetch_gene_names_batch(missing_accs)
             gene_cache.update(new_genes)
         except Exception:
             st.warning("Could not fetch gene names from UniProt.")
@@ -174,6 +175,11 @@ def show_results(project_path: str, af3_folder: str):
     sort_key = sort_column_map.get(sort_by, "iptm")
     filtered_results = sorted(filtered_results, key=lambda r: r.get(sort_key) or 0, reverse=True)
 
+    # AlphaPulldown (AF2-multimer) rows have no PAE-filtered contacts but do carry
+    # a spatial Cβ–Cβ count. Surface it as an extra column so AP-only datasets
+    # aren't left with empty contact columns. AF3-only datasets keep the old layout.
+    has_spatial = any(r.get('contacts_spatial') is not None for r in filtered_results)
+
     display_data = []
     # Keep mapping from display row index to prediction name
     row_to_pred = []
@@ -193,7 +199,7 @@ def show_results(project_path: str, af3_folder: str):
             return int(v) if v is not None else "-"
 
         row_to_pred.append(pred_name)
-        display_data.append({
+        row = {
             'Bait': bait_label,
             'Prey': prey_label,
             'Model': model_label,
@@ -204,9 +210,14 @@ def show_results(project_path: str, af3_folder: str):
             'PAE≤3': _contact('contacts_pae3'),
             'PAE≤5': _contact('contacts_pae5'),
             'PAE≤8': _contact('contacts_pae8'),
-        })
+        }
+        if has_spatial:
+            row['Cβ≤8'] = _contact('contacts_spatial')
+        display_data.append(row)
 
     df = pd.DataFrame(display_data)
+    if has_spatial:
+        st.caption("Cβ≤8 = spatial Cβ–Cβ contacts < 8 Å (AlphaPulldown / AF2-multimer; no PAE filter).")
 
     # Display with row selection — click a row to go to Detailed Analysis
     st.caption("Click a row to select it for detailed analysis")
@@ -221,6 +232,7 @@ def show_results(project_path: str, af3_folder: str):
             "PAE≤3": st.column_config.NumberColumn(width="small"),
             "PAE≤5": st.column_config.NumberColumn(width="small"),
             "PAE≤8": st.column_config.NumberColumn(width="small"),
+            "Cβ≤8": st.column_config.NumberColumn(width="small"),
         },
         key="results_table"
     )

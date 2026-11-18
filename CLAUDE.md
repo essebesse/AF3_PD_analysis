@@ -12,10 +12,13 @@ Supported input formats (auto-detected per folder):
 |---|---|---|
 | **AF3 local pipeline** | `seed-N_sample-M/` subdirs + `ranking_scores.csv` | full: iPTM, PTM, ipSAE, interface pLDDT, PAE-binned contacts |
 | **AF3 Server flat** | `fold_<name>_model_N.cif` + `fold_<name>_full_data_N.json` directly in folder | full (same as above) |
-| **AlphaPulldown / AF2-multimer** | `ranking_debug.json` + `ranked_N.pdb` | partial: combined `iptm+ptm`, spatial Cβ contacts, interface pLDDT from PDB B-factors. No ipSAE/PAE (AF2 output has no per-residue PAE matrix) |
-| **Legacy `format: 'af2'` caches** | pre-existing cache files with `iptm: None` + `iptm_ptm` | display-only — fields are normalized at load time |
+| **AF2 with PAE CSVs** (`format: 'af2'`) | `ranking_debug.json` + `ranked_N.pdb` + `ranked_N_PAE.csv`, in the folder or in `seq/` | full, same definitions as AF3. `core/af2_pae.py` builds an AF3-shaped confidences dict so the AF3 code paths run unchanged. iPTM = combined `iptm+ptm` |
+| **AlphaPulldown** (`format: 'alphapulldown'`) | same, without PAE CSVs | partial: combined `iptm+ptm`, spatial Cβ contacts, interface pLDDT from PDB B-factors. PAE only exists in `result_*.pkl` (~1 GB each), deliberately not read |
+| **Legacy `format: 'af2'` caches** (from the retired af2_af3_analysis_app) | cache files with `iptm: None` + `iptm_ptm` | fields are normalized at load time |
 
-Computes confidence metrics across **all 5 seed/sample models per prediction**, not just top-ranked.
+Computes confidence metrics across **all 5 seed/sample models per prediction**, not just top-ranked. Models whose `seed-N_sample-M` files were deleted are skipped (`af3_models_on_disk()` in scanner, same check in `analyze_prediction_all_models`); otherwise `load_confidences` falls back to the top-level files and the top model would be reported under every label.
+
+`example_data/IFT27_pulldown/` (two small AF3 pairs) is for first runs and regression checks. `validation/ipsae_vs_reference.py` compares ipSAE with Dunbrack's `ipsae.py` (agreement < 5e-7).
 
 ## Running the App
 
@@ -52,11 +55,13 @@ Python 3.11 venv is at `.venv/`.
 
 **Core modules** (`core/`):
 
+- `af2_pae.py` — AF2 helpers: `af2_work_dir()` (folder or `seq/`), `load_af2_confidences()` (PAE CSV + PDB B-factors → AF3-shaped dict, heavy atoms only, aligned with `CIFParser.atoms`).
+- `slurm_config.py` — reads optional `slurm_config.toml` (gitignored; template `slurm_config.example.toml`); `slurm_available()` hides the SLURM tab when `sbatch` is missing.
 - `scanner.py` — `AF3Scanner` class + format detectors (`_is_af3_server_flat`, `_is_alphapulldown_format`). `load_prediction_data()` dispatches to AF3/server-flat/AlphaPulldown loaders. `find_af3_projects_recursive()` walks a directory tree to discover predictions in any of the supported formats.
-- `analyzer.py` — Heavy analysis: `analyze_prediction_all_models()` dispatches by format (`_analyze_server_flat`, `_analyze_alphapulldown`). Computes ipSAE (Dunbrack 2025), interface contacts, interface pLDDT. `CIFParser` is **gemmi-backed** — preserves the legacy attribute-dict shape (`atoms[i] = {seq_id, chain_id, atom_name, res_name, x, y, z}`) so callers that walk `parser.atoms` in CIF order (e.g. for `atom_plddts` indexing) keep working.
+- `analyzer.py` — Heavy analysis: `analyze_prediction_all_models()` dispatches by format (`_analyze_server_flat`, `_analyze_alphapulldown`). Computes ipSAE (Dunbrack 2025), interface contacts, interface pLDDT. `_pae_interface_metrics()` is the single contact/iPLDDT routine for AF3 local, AF3 Server and AF2. `CIFParser` is **gemmi-backed**, skips hydrogens, and preserves the legacy attribute-dict shape (`atoms[i] = {seq_id, chain_id, atom_name, res_name, x, y, z}`) so callers that walk `parser.atoms` in CIF order (e.g. for `atom_plddts` indexing) keep working.
 - `interface_analyzer.py` — Contact classification (hydrophobic/polar/charged/aromatic), hub residue detection. `analyze_interface()` runs PAE + spatial filtering for AF3; `analyze_interface_spatial()` runs spatial-only for AlphaPulldown.
 - `pae_plotter.py` — PAE matrix visualization: full matrix, interface zoom, model comparison. Uses green-white colormap.
-- `viewer_3d.py` — 3Dmol.js-based 3D structure viewer with PAE interface coloring. **The 3Dmol-min.js bundle is inlined into the HTML via `_load_3dmol_js()` + `@lru_cache`** — no dependency on Streamlit's static serving. Supports both CIF (AF3) and PDB (AlphaPulldown) via `model_format` arg.
+- `viewer_3d.py` — 3Dmol.js-based 3D structure viewer with PAE interface coloring. **The 3Dmol-min.js bundle is inlined into the HTML via `_load_3dmol_js()` + `@lru_cache`** — no dependency on Streamlit's static serving. Supports both CIF (AF3) and PDB (AlphaPulldown) via `model_format` arg. **Interactive residue selection is entirely client-side**: clicking a residue toggles side-chain sticks + a persistent label, hovering shows a transient label. `setBaseStyles()` (the chain/PAE cartoon coloring) is wrapped in a JS function and re-applied on every selection change, so sticks add/remove cleanly without losing interface colors. No Streamlit round-trip — picks never reach Python, so there's nothing in the server log when you click.
 - `pymol_script.py` — PyMOL .py script generator for offline interface visualization.
 - `slurm_manager.py` — SLURM job submission and status checking for cluster execution.
 - `run_analysis_cli.py` — Standalone CLI entry point for SLURM jobs (bypasses Streamlit).
@@ -64,7 +69,7 @@ Python 3.11 venv is at `.venv/`.
 
 ## Expected Data Layout
 
-Three formats, auto-detected per folder by the scanner:
+Four formats, auto-detected per folder by the scanner:
 
 ```
 # AF3 local pipeline
@@ -81,19 +86,19 @@ Three formats, auto-detected per folder by the scanner:
   fold_<name>_full_data_0.json … fold_<name>_full_data_4.json
   fold_<name>_summary_confidences_0.json … _summary_confidences_4.json
 
-# AlphaPulldown (AF2-multimer)
+# AF2-multimer (AlphaPulldown, or AF2 with PAE CSVs); files may be in <bait>_and_<prey>/seq/
 <project>/pulldown/<bait>_and_<prey>/
   ranking_debug.json
   ranked_0.pdb … ranked_4.pdb
-  unrelaxed_model_*_multimer_v3_pred_0.pdb
+  ranked_0_PAE.csv … ranked_4_PAE.csv   # optional
 ```
 
 Analysis results cache to `af3_app_all_models_analysis.json` at the predictions-folder level. Per-prediction `af3_app_analysis.json` files are also written inside each pair folder for fast Detailed-Analysis lookup.
 
 ## SLURM execution flow
 
-1. User clicks Submit on the SLURM tab → `submit_slurm_jobs()` writes `_slurm_chunk_<i>.txt`, sbatches one job per chunk, sets `st.session_state['slurm_job_ids']`, then **`st.rerun()`** so the folder-state panel above the Submit button picks up the new chunk files.
-2. Each SLURM job runs the analyzer over its chunk list and writes `_slurm_results_<i>.json`.
+1. User clicks Submit on the SLURM tab → `submit_slurm_jobs()` writes `_slurm_chunk_<i>.txt`, sbatches ONE job array (`--array=0-N%max_concurrent`, options from `slurm_config.toml`), sets `st.session_state['slurm_job_ids']`, then **`st.rerun()`** so the folder-state panel above the Submit button picks up the new chunk files.
+2. Each array task (`$SLURM_ARRAY_TASK_ID` = chunk index) runs the analyzer over its chunk list and writes `_slurm_results_<i>.json`.
 3. The user clicks **🔄 Refresh** on the SLURM tab (no auto-refresh — we used to have one, but `window.parent.location.reload()` was wiping session_state; a `@st.fragment(run_every="30s")` approach also had edge cases. Now it's a single explicit button.)
 4. On the next render, `_auto_merge_if_needed()` (called from `app.py` top level AND from inside `_render_slurm_state_panel`) detects all chunks present + cache missing/stale, fires `merge_slurm_results()` inside a visible `st.status` block, then `st.rerun(scope="app")`.
 5. `_slurm_merge_attempted_for: <folder>` marker prevents double-firing. Manual **📦 Merge chunks into cache** button is always available as a fallback / retry.
