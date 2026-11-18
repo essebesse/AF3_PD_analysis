@@ -117,6 +117,23 @@ python -m streamlit run app.py
 
 Then open your browser to `http://localhost:8501`
 
+The app's `.streamlit/config.toml` switches off the e-mail prompt that newer
+Streamlit versions show on first start, so the app also starts without a
+terminal (e.g. in a container or with `nohup`).
+
+### Command line (no browser)
+
+`core/run_analysis_cli.py` runs the same analysis without the web interface
+and writes the same result files, which the app then reads:
+
+```bash
+python core/run_analysis_cli.py --input_dir /path/to/project --cpus 8 [--all_models] [--pae_cutoff 10]
+```
+
+`--input_dir` is found the same way as in the app: `<project>/AF3/` if it
+exists, otherwise the folder itself. If no model can be analysed, the command
+exits with code 1 and lists prediction folders found further down.
+
 ### Try it on the example data
 
 `example_data/IFT27_pulldown/` holds two AF3 predictions from a human IFT27
@@ -209,7 +226,7 @@ AlphaPulldown stores the PAE matrix only inside the `result_*.pkl` files
    * **Local**: multiprocessing on the current machine; live estimate of runtime based on prediction count, CPUs, and format.
    * **SLURM**: only shown when `sbatch` is on PATH. Splits the predictions into N chunks and submits them as one job array with a limit on how many tasks run at once. After the tasks finish, click 🔄 **Refresh** in the SLURM panel: the app detects all chunk files are present and automatically merges them into the analysis cache (with a visible progress box). A manual **📦 Merge chunks into cache** button is always available as a fallback. See [SLURM settings](#slurm-settings).
 3. **Results**: sortable / filterable table of all models with CSV / XLSX export.
-4. **Detailed Analysis**: pick one prediction to view PAE plots, interactive 3D structure (3Dmol.js), interface contacts table, hub residues, side-by-side model comparison, and PyMOL script export.
+4. **Detailed Analysis**: pick one prediction to view PAE plots, interactive 3D structure (3Dmol.js; ligands and ions drawn as sticks), interface contacts table, hub residues, side-by-side model comparison, and PyMOL script export.
 
 ## SLURM settings
 
@@ -237,12 +254,12 @@ af3_analysis_app/
 │   ├── analyzer.py              # Analysis dispatch by format (ipSAE, contacts, pLDDT); gemmi-backed CIFParser
 │   ├── af2_pae.py               # AF2 input: seq/ layout, ranked_N_PAE.csv → AF3-shaped confidences
 │   ├── slurm_config.py          # Reads slurm_config.toml (site-specific SLURM options)
-│   ├── interface_analyzer.py    # Contact classification + hub residues (PAE-aware and spatial-only paths)
+│   ├── interface_analyzer.py    # Interface contacts + hub residues (PAE-aware and spatial-only paths)
 │   ├── pae_plotter.py           # PAE matrix visualization
 │   ├── viewer_3d.py             # 3Dmol.js 3D viewer (JS bundle inlined into HTML, fully offline)
 │   ├── pymol_script.py          # PyMOL .py script generator
 │   ├── slurm_manager.py         # SLURM job submission and status checking
-│   ├── run_analysis_cli.py      # CLI entry point used by SLURM jobs (bypasses Streamlit)
+│   ├── run_analysis_cli.py      # Command-line analysis (same results as the app, no browser)
 │   └── utils.py                 # Helpers: score formatting, UniProt batch lookup, prediction-name parsing, legacy-cache normalization
 ├── static/
 │   └── 3Dmol-min.js             # Bundled 3Dmol.js (~526 KB), inlined into the viewer HTML at render time
@@ -257,6 +274,7 @@ af3_analysis_app/
 
 ## Analysis Metrics
 
+- **Which chains**: every metric is computed for one pair of chains per model, the first two polymer chains (protein, DNA, RNA). Ligand and ion chains are skipped, whatever their position in the input (in AF3 a ligand has one token per atom on a single residue number, an ion a single token). With fewer than two polymer chains (e.g. one protein plus a lipid), the first two chains of any kind are used. Other chain pairs in larger complexes are not scored.
 - **iPTM**: Interface predicted template modeling score. For AF2-multimer the displayed value is the combined ranking confidence (0.8·iPTM + 0.2·pTM) from `ranking_debug.json`, since that file doesn't store the two separately.
 - **ipSAE**: Interface predicted structure alignment error score (Dunbrack 2025), PAE cutoff 10 Å by default, the larger of the two directions (A→B, B→A). AF3, and AF2 with PAE CSVs.
 - **iPLDDT**: Mean per-atom pLDDT over residues in contacts with PAE ≤ 6 Å. From AF3 `atom_plddts`, or from the PDB B-factor column for AF2 (hydrogens excluded).
@@ -270,7 +288,9 @@ af3_analysis_app/
 - `af3_app_all_models_analysis.json`: full per-model result list at the predictions-folder level. The Results and Detailed Analysis pages read this.
 - `af3_app_analysis.json`: per-prediction subset written inside each pair folder, used as a fast-path by Detailed Analysis.
 - `af3_app_analysis_summary.txt`: human-readable summary grouped by confidence tier, written after local analysis.
+- Every result record has a `format` field: `af3` (AF3 local), `server_flat` (AlphaFold Server), `af2` (AF2 with PAE CSVs) or `alphapulldown` (AF2 without PAE). A model of an `af2` prediction whose PAE CSV could not be used is analysed without PAE and carries a `warning` explaining why; the Results page shows these.
 - Legacy caches (`format: 'af2'` with `iptm: None` + `iptm_ptm`) from older analyzers are normalized at load time; no need to re-run.
+- Result files written by versions before 2026-11-18 can be wrong in two cases and should be re-analysed: with all five `seed-N_sample-M` folders present, "top model" analyses used the first row of `ranking_scores.csv` instead of the highest-ranked model; and when those folders had been deleted, "all models" analyses repeated the top model five times.
 
 ## Validation
 

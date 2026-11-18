@@ -163,9 +163,12 @@ nodes are read from `slurm_config.toml` (template: `slurm_config.example.toml`).
 #### 3D Structure
 - Interactive 3D view (3Dmol.js) with interface residues coloured by PAE.
 - Click a residue to show or hide its side chain and a label; hover to identify it.
+- Proteins are labelled with the bait / prey names when the folder name has the
+  form `<bait>_and_<prey>`, otherwise "Chain A", "Chain B". Ligands and ions are
+  drawn as sticks and labelled with their residue name, e.g. "ATP (C)".
 
 #### PAE Plots
-- Full PAE matrix and a zoom on the chain A / chain B blocks.
+- Full PAE matrix and a zoom on the inter-chain blocks of the scored pair.
 - Not available for AF2 predictions without PAE CSV files.
 
 #### Interface Contacts
@@ -189,6 +192,11 @@ nodes are read from `slurm_config.toml` (template: `slurm_config.example.toml`).
 ---
 
 ## 4. Metrics
+
+All metrics are computed for one pair of chains per model: the first two
+polymer chains (protein, DNA or RNA). Ligand and ion chains are skipped
+wherever they are in the input. If a model has only one polymer chain (for
+example a protein with a lipid), the first two chains of any kind are used.
 
 | Metric | Definition | Available for |
 |---|---|---|
@@ -239,6 +247,17 @@ Without ipSAE (AF2 without PAE CSVs) the tiers use iPTM: > 0.8, > 0.6, > 0.4.
 - UniProt lookups need internet access; behind a proxy they can fail. This does
   not affect the analysis.
 
+### "analysed without PAE" warning (AF2)
+- A `ranked_N_PAE.csv` file exists but does not fit its `ranked_N.pdb` (not a
+  square matrix, or a different number of residues). That model is analysed
+  without PAE (spatial contacts only); the warning names the file.
+
+### Results from older versions
+- Result files written before 2026-11-18 can be wrong in two cases: "top model"
+  analyses of predictions with all `seed-N_sample-M` folders present, and "all
+  models" analyses of predictions whose seed folders were deleted. Re-run the
+  analysis (**Re-analyze**) for such folders.
+
 ### Adding predictions later
 - In **Analyze**, tick **Skip predictions already in cache** so only new folders are processed.
 
@@ -252,6 +271,7 @@ Without ipSAE (AF2 without PAE CSVs) the tiers use iPTM: > 0.8, > 0.6, > 0.4.
 
 ```bash
 ./run.sh                                  # launch the app
+python core/run_analysis_cli.py --input_dir /path/to/project --cpus 8   # analysis without the browser
 squeue -u $USER | grep AF3app             # SLURM job status
 ssh -L 8501:localhost:8501 user@server    # port forwarding
 ```

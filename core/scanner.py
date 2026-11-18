@@ -484,6 +484,7 @@ def load_prediction_data(pred_dir: Path) -> Optional[Dict]:
             'chain_ptm': summary.get('chain_ptm', []),
             'seed_samples': seed_samples,
             'prediction_dir': str(pred_dir),
+            'format': 'af3',
         }
     except Exception as e:
         print(f"Error loading {pred_dir}: {e}")
@@ -577,6 +578,7 @@ class AF3Scanner:
                 'bait': bait_name,
                 'prey': prey_name,
                 'prediction_dir': str(resolved),
+                'format': 'af3',
             })
 
         return self.predictions

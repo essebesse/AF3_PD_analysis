@@ -559,7 +559,8 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
             'contacts_pae8': contacts_pae8,
             'fraction_disordered': fraction_disordered,
             'pae_mean': float(np.mean(pae_matrix)) if pae_matrix.size > 0 else 0,
-            'sequences': sequences
+            'sequences': sequences,
+            'format': 'af3',
         }
 
     except Exception as e:
