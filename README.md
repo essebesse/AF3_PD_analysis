@@ -1,8 +1,32 @@
 # AF3 / AlphaPulldown Analysis Web App
 
-A Streamlit-based GUI for analyzing protein–protein structure prediction pulldown data.
-Originally written for AlphaFold 3 (AF3-PD) output; now also handles AlphaFold Server
-flat-format folders and AlphaPulldown (AF2-multimer) output.
+A browser-based app (Streamlit) for analysing pulldown-style screens of
+protein–protein structure predictions, where one bait protein is predicted
+against many prey proteins. It reads AlphaFold 3 output (local pipeline or
+AlphaFold Server downloads) and AlphaFold 2 multimer output (AlphaPulldown or
+AF2), scores the interface of every model (iPTM, ipSAE, interface pLDDT,
+PAE-filtered contacts), and lets you sort, filter and inspect the results,
+including PAE plots and an interactive 3D view. No programming is needed to
+use it.
+
+## Quick start
+
+```bash
+git clone https://github.com/essebesse/AF3_PD_analysis.git
+cd AF3_PD_analysis
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+./run.sh
+```
+
+Open `http://localhost:8501`, enter the full path to
+`example_data/IFT27_pulldown` as the project folder, and follow the four steps
+(Load Data, Analyze, Results, Detailed Analysis). A step-by-step guide is in
+[AF3_PD_USER_GUIDE.md](AF3_PD_USER_GUIDE.md).
+
+Tested with Python 3.10 and 3.11 on Linux (on Python 3.10 the `tomli`
+package is installed for reading the optional SLURM settings).
 
 ## Features
 
@@ -22,11 +46,12 @@ flat-format folders and AlphaPulldown (AF2-multimer) output.
 It is recommended to use an isolated Python environment. Either `venv` or
 `conda` works; pick whichever your site supports.
 
-### Option 1: venv (Python 3.11 recommended)
+### Option 1: venv (Python 3.10 or 3.11)
 
 ```bash
-# Clone or copy the repository
-cd /path/to/af3_analysis_app/
+# Clone the repository
+git clone https://github.com/essebesse/AF3_PD_analysis.git
+cd AF3_PD_analysis
 
 # Ubuntu/Debian only: install the venv stdlib module if missing
 sudo apt install python3-venv     # skip on macOS and on clusters where it's already present
@@ -262,6 +287,16 @@ python validation/ipsae_vs_reference.py ipsae.py /path/to/AF3   # your own folde
 On the 7 models of the example data the largest difference is 4.7×10⁻⁷. The
 same agreement (below 5×10⁻⁷) was found for the 5 models of an AF2-multimer
 prediction with PAE CSVs (ARL13B–INPP5E, not bundled).
+
+## How to cite
+
+A preprint describing the app is in preparation. Until it is available, please
+cite this repository (https://github.com/essebesse/AF3_PD_analysis) and the
+methods the metrics come from:
+
+- AlphaFold 3: Abramson J, et al. (2024) Nature 630:493–500. https://doi.org/10.1038/s41586-024-07487-w
+- ipSAE: Dunbrack RL (2025) bioRxiv. https://doi.org/10.1101/2025.02.10.637595
+- AlphaPulldown (if used): Yu D, et al. (2023) Bioinformatics 39:btac749. https://doi.org/10.1093/bioinformatics/btac749
 
 ## License
 
