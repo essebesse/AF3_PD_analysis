@@ -171,7 +171,6 @@ nodes are read from `slurm_config.toml` (template: `slurm_config.example.toml`).
 #### Interface Contacts
 - Residue pairs with PAE ≤ 10 Å and Cβ–Cβ distance ≤ 8 Å (Cα for glycine). For
   AF2 without PAE: Cβ–Cβ ≤ 8 Å only.
-- Breakdown by interaction type (hydrophobic, polar, charged, aromatic).
 - **Hub residues:** residues with the most contacts on each chain.
 - **Interface regions:** contiguous stretches of interface residues on each protein.
 

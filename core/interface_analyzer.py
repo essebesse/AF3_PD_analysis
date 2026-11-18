@@ -10,73 +10,6 @@ from typing import Dict, List, Tuple, Optional
 from core.analyzer import CIFParser, extract_chain_indices
 
 
-# Amino acid properties for interaction classification
-HYDROPHOBIC_RESIDUES = {'A', 'V', 'L', 'I', 'M', 'F', 'W', 'P', 'G'}
-POLAR_RESIDUES = {'S', 'T', 'N', 'Q', 'Y', 'C'}
-CHARGED_POSITIVE = {'R', 'K', 'H'}
-CHARGED_NEGATIVE = {'D', 'E'}
-AROMATIC_RESIDUES = {'F', 'Y', 'W', 'H'}
-POLAR_ATOMS = {'N', 'O', 'S'}
-
-
-def classify_interaction(res_name_a: str, res_name_b: str,
-                         distance: float) -> str:
-    """
-    Classify chemical interaction type between two residues based on
-    residue identity and CB-CB distance.
-
-    Note: Since we only have CB/CA representative distances (not actual
-    closest-atom distances), the distance thresholds are adjusted for
-    CB-CB geometry. This is an approximation.
-
-    Args:
-        res_name_a: Three-letter amino acid code for residue A
-        res_name_b: Three-letter amino acid code for residue B
-        distance: CB-CB distance in Angstrom
-
-    Returns:
-        One of: 'hydrophobic', 'hydrogen_bond', 'salt_bridge',
-                'aromatic', 'polar', 'other'
-    """
-    # Residues whose sidechains can donate/accept H-bonds
-    HBOND_RESIDUES = {'S', 'T', 'N', 'Q', 'Y', 'C', 'D', 'E', 'R', 'K', 'H', 'W'}
-
-    # Convert to one-letter codes
-    three_to_one = {
-        'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
-        'GLU': 'E', 'GLN': 'Q', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
-        'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
-        'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
-    }
-
-    aa_a = three_to_one.get(res_name_a.upper(), 'X')
-    aa_b = three_to_one.get(res_name_b.upper(), 'X')
-
-    # Salt bridge: charged pairs (R/K/H with D/E) and dist < 5.5 (CB-CB)
-    if aa_a in CHARGED_POSITIVE and aa_b in CHARGED_NEGATIVE and distance < 5.5:
-        return 'salt_bridge'
-    if aa_a in CHARGED_NEGATIVE and aa_b in CHARGED_POSITIVE and distance < 5.5:
-        return 'salt_bridge'
-
-    # Hydrogen bond: at least one residue has H-bond capable sidechain, dist < 5.0 (CB-CB)
-    if (aa_a in HBOND_RESIDUES or aa_b in HBOND_RESIDUES) and distance < 5.0:
-        return 'hydrogen_bond'
-
-    # Aromatic: aromatic residues (F, Y, W, H) both sides and dist < 5.5
-    if aa_a in AROMATIC_RESIDUES and aa_b in AROMATIC_RESIDUES and distance < 5.5:
-        return 'aromatic'
-
-    # Hydrophobic: nonpolar residues and dist < 5.0
-    if aa_a in HYDROPHOBIC_RESIDUES and aa_b in HYDROPHOBIC_RESIDUES and distance < 5.0:
-        return 'hydrophobic'
-
-    # Polar: everything else with dist < 5.0
-    if distance < 5.0:
-        return 'polar'
-
-    return 'other'
-
-
 def analyze_interface(cif_path: Path,
                       confidences: dict,
                       pae_cutoff: float = 10.0,
@@ -94,7 +27,6 @@ def analyze_interface(cif_path: Path,
         'contacts': list of contact dicts
         'hub_residues_a': list of (res_id, res_name, contact_count)
         'hub_residues_b': same for chain B
-        'chemical_breakdown': dict of interaction_type -> count
         'summary': dict with total_contacts, mean_pae, mean_distance, interface_area_estimate
     """
     if not cif_path.exists():
@@ -102,7 +34,6 @@ def analyze_interface(cif_path: Path,
             'contacts': [],
             'hub_residues_a': [],
             'hub_residues_b': [],
-            'chemical_breakdown': {},
             'summary': {}
         }
 
@@ -112,7 +43,6 @@ def analyze_interface(cif_path: Path,
             'contacts': [],
             'hub_residues_a': [],
             'hub_residues_b': [],
-            'chemical_breakdown': {},
             'summary': {}
         }
 
@@ -122,7 +52,6 @@ def analyze_interface(cif_path: Path,
             'contacts': [],
             'hub_residues_a': [],
             'hub_residues_b': [],
-            'chemical_breakdown': {},
             'summary': {}
         }
 
@@ -132,7 +61,6 @@ def analyze_interface(cif_path: Path,
             'contacts': [],
             'hub_residues_a': [],
             'hub_residues_b': [],
-            'chemical_breakdown': {},
             'summary': {}
         }
 
@@ -142,7 +70,6 @@ def analyze_interface(cif_path: Path,
             'contacts': [],
             'hub_residues_a': [],
             'hub_residues_b': [],
-            'chemical_breakdown': {},
             'summary': {}
         }
 
@@ -209,8 +136,6 @@ def analyze_interface(cif_path: Path,
             res_name_a = res_names.get((chain_a_id, res_a), 'UNK')
             res_name_b = res_names.get((chain_b_id, res_b), 'UNK')
 
-            interaction_type = classify_interaction(res_name_a, res_name_b, dist)
-
             contacts.append({
                 'chain_a_res': res_a,
                 'chain_b_res': res_b,
@@ -218,18 +143,11 @@ def analyze_interface(cif_path: Path,
                 'pae': round(float(pae_val), 2),
                 'chain_a_aa': res_name_a,
                 'chain_b_aa': res_name_b,
-                'interaction_type': interaction_type
             })
 
     # Find hub residues
     hub_residues_a = find_hub_residues(contacts, 'chain_a_res')
     hub_residues_b = find_hub_residues(contacts, 'chain_b_res')
-
-    # Calculate chemical breakdown
-    chemical_breakdown = {}
-    for contact in contacts:
-        itype = contact.get('interaction_type', 'other')
-        chemical_breakdown[itype] = chemical_breakdown.get(itype, 0) + 1
 
     # Summary statistics
     if contacts:
@@ -251,7 +169,6 @@ def analyze_interface(cif_path: Path,
         'contacts': contacts,
         'hub_residues_a': hub_residues_a,
         'hub_residues_b': hub_residues_b,
-        'chemical_breakdown': chemical_breakdown,
         'summary': summary
     }
 
@@ -266,17 +183,17 @@ def analyze_interface_spatial(cif_path: Path,
     """
     if not cif_path.exists():
         return {'contacts': [], 'hub_residues_a': [], 'hub_residues_b': [],
-                'chemical_breakdown': {}, 'summary': {}}
+                'summary': {}}
 
     parser = CIFParser(str(cif_path), verbose=False)
     if not parser.parse_atoms():
         return {'contacts': [], 'hub_residues_a': [], 'hub_residues_b': [],
-                'chemical_breakdown': {}, 'summary': {}}
+                'summary': {}}
 
     chain_ids = parser.get_chain_ids()
     if len(chain_ids) < 2:
         return {'contacts': [], 'hub_residues_a': [], 'hub_residues_b': [],
-                'chemical_breakdown': {}, 'summary': {}}
+                'summary': {}}
 
     chain_a_id, chain_b_id = chain_ids[0], chain_ids[1]
     chain_a_residues = parser.get_chain_residues(chain_a_id)
@@ -317,15 +234,10 @@ def analyze_interface_spatial(cif_path: Path,
                 'pae': None,
                 'chain_a_aa': res_name_a,
                 'chain_b_aa': res_name_b,
-                'interaction_type': classify_interaction(res_name_a, res_name_b, dist),
             })
 
     hub_residues_a = find_hub_residues(contacts, 'chain_a_res')
     hub_residues_b = find_hub_residues(contacts, 'chain_b_res')
-
-    chemical_breakdown = {}
-    for c in contacts:
-        chemical_breakdown[c['interaction_type']] = chemical_breakdown.get(c['interaction_type'], 0) + 1
 
     if contacts:
         mean_distance = float(np.mean([c['distance'] for c in contacts]))
@@ -344,7 +256,6 @@ def analyze_interface_spatial(cif_path: Path,
         'contacts': contacts,
         'hub_residues_a': hub_residues_a,
         'hub_residues_b': hub_residues_b,
-        'chemical_breakdown': chemical_breakdown,
         'summary': summary,
     }
 

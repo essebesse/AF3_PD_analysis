@@ -436,7 +436,6 @@ def show_detailed(project_path: str, af3_folder: str):
 
                     contacts = interface_result.get('contacts', [])
                     summary = interface_result.get('summary', {})
-                    chemical_breakdown = interface_result.get('chemical_breakdown', {})
                     hub_residues_a = interface_result.get('hub_residues_a', [])
                     hub_residues_b = interface_result.get('hub_residues_b', [])
 
@@ -465,14 +464,7 @@ def show_detailed(project_path: str, af3_folder: str):
                             col4.metric("Interface Area",
                                         f"{summary.get('interface_area_estimate', 0)} residues")
 
-                        # Show chemical interaction breakdown
-                        st.subheader("Chemical Interaction Types")
                         import pandas as pd
-                        breakdown_df = pd.DataFrame([
-                            {'Type': k, 'Count': v}
-                            for k, v in sorted(chemical_breakdown.items(), key=lambda x: x[1], reverse=True)
-                        ])
-                        st.bar_chart(breakdown_df.set_index('Type'))
 
                         # Show top contacts table with protein names as column headers
                         contact_df = pd.DataFrame(contacts[:50])  # Show top 50
@@ -494,11 +486,10 @@ def show_detailed(project_path: str, af3_folder: str):
                             'chain_b_aa': f'{name_b} aa',
                             'distance': 'Cβ–Cβ (Å)',
                             'pae': 'PAE (Å)',
-                            'interaction_type': 'Type',
                         }
                         # Residue/aa pairs side by side, then the measurements
                         order = [c for c in ('chain_a_res', 'chain_a_aa', 'chain_b_res', 'chain_b_aa',
-                                             'distance', 'pae', 'interaction_type')
+                                             'distance', 'pae')
                                  if c in contact_df.columns]
                         contact_df = contact_df[order + [c for c in contact_df.columns if c not in order]]
                         contact_df = contact_df.rename(columns=col_rename)
