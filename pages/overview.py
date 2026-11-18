@@ -55,12 +55,19 @@ def show_load_data(project_path: str, af3_folder: str):
         # only the combined iptm_ptm score
         normalize_cache_records(cached)
 
-        # Summary stats from cache
+        # Summary stats from cache: one record per prediction, the top-ranked
+        # model (as on the Results and Detailed Analysis pages). Fall back to
+        # the highest-iPTM model only if no record is flagged as top-ranked.
         best = {}
         for r in cached:
             name = r['prediction_name']
-            iptm = r.get('iptm') or 0
-            if name not in best or iptm > (best[name].get('iptm') or 0):
+            cur = best.get(name)
+            if cur is None:
+                best[name] = r
+            elif r.get('is_top_ranked') and not cur.get('is_top_ranked'):
+                best[name] = r
+            elif (not cur.get('is_top_ranked')
+                  and (r.get('iptm') or 0) > (cur.get('iptm') or 0)):
                 best[name] = r
         per_pred = list(best.values())
         iptms = [r.get('iptm') or 0 for r in per_pred]

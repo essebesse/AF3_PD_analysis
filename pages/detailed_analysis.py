@@ -492,9 +492,17 @@ def show_detailed(project_path: str, af3_folder: str):
                             'chain_b_res': f'{name_b} res',
                             'chain_a_aa': f'{name_a} aa',
                             'chain_b_aa': f'{name_b} aa',
+                            'distance': 'Cβ–Cβ (Å)',
+                            'pae': 'PAE (Å)',
+                            'interaction_type': 'Type',
                         }
+                        # Residue/aa pairs side by side, then the measurements
+                        order = [c for c in ('chain_a_res', 'chain_a_aa', 'chain_b_res', 'chain_b_aa',
+                                             'distance', 'pae', 'interaction_type')
+                                 if c in contact_df.columns]
+                        contact_df = contact_df[order + [c for c in contact_df.columns if c not in order]]
                         contact_df = contact_df.rename(columns=col_rename)
-                        st.dataframe(contact_df, width='stretch')
+                        st.dataframe(contact_df, width='stretch', hide_index=True)
 
                         # Hub residues analysis
                         st.subheader("Hub Residues")

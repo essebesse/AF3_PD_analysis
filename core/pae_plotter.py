@@ -299,12 +299,12 @@ def plot_all_models_comparison(pae_matrices: List[np.ndarray],
         else:
             ax.set_title(label, fontsize=11, fontweight='bold')
 
-        # Minimal ticks
-        tick_positions = [0, boundaries[-1] - 1]
-        tick_labels_list = ['1', str(boundaries[-1])]
-        for b in boundaries[1:-1]:
-            tick_positions.extend([b - 1, b])
-            tick_labels_list.extend([str(b), '1'])
+        # Minimal ticks: residue 1 at the origin and the last residue of each
+        # chain (chain-local numbering). Labelling both sides of a chain
+        # boundary made the two labels overlap.
+        tick_positions = [0] + [b - 1 for b in boundaries[1:]]
+        tick_labels_list = ['1'] + [str(boundaries[i + 1] - boundaries[i])
+                                    for i in range(len(boundaries) - 1)]
         ax.set_xticks(tick_positions)
         ax.set_xticklabels(tick_labels_list, fontsize=8)
         ax.set_yticks(tick_positions)
