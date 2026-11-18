@@ -233,6 +233,10 @@ def show_detailed(project_path: str, af3_folder: str):
 
                 # Recompute all derived data
                 confidences = load_confidences(pred_dir, selected_pred_name, seed, sample)
+                pae_problem = None
+                if confidences is None and _is_af2:
+                    from core.af2_pae import load_af2_confidences_checked
+                    pae_problem = load_af2_confidences_checked(struct_dir, sample)[1]
 
                 chain_ids_resolved = []
                 chain_lengths_resolved = []
@@ -258,22 +262,6 @@ def show_detailed(project_path: str, af3_folder: str):
                     except Exception:
                         pass
 
-                if chain_ids_resolved:
-                    bait_acc, prey_acc = split_prediction_name(selected_pred_name)
-                    accs = [bait_acc, prey_acc] if prey_acc else [bait_acc]
-                    protein_names = []
-                    for i, cid in enumerate(chain_ids_resolved):
-                        if i < len(accs):
-                            acc = accs[i]
-                            # gene_cache stores '' for accessions UniProt could
-                            # not resolve, so .get(acc, acc) would yield '' (the
-                            # default only fires when the key is absent). Fall
-                            # back to the accession when the gene name is empty.
-                            name = gene_cache.get(acc) or acc
-                            protein_names.append(name)
-                        else:
-                            protein_names.append(cid)
-
                 # Find structure file — local-pipeline CIF, AF3 Server flat,
                 # or AlphaPulldown (AF2-multimer) PDB
                 sample_dir = pred_dir / f"seed-{seed}_sample-{sample}"
@@ -287,6 +275,43 @@ def show_detailed(project_path: str, af3_folder: str):
                 ]
                 cif_file = next((p for p in cif_candidates if p.exists()),
                                 cif_candidates[0])
+
+                # Chain labels. The scored pair (first two polymer chains) gets
+                # the bait / prey names when the folder name has the form
+                # <bait>_and_<prey>; ligand and ion chains get their residue
+                # name, e.g. "ATP (C)"; anything else "Chain X".
+                pair_ids = list(chain_ids_resolved[:2])
+                nonpolymer_ids = []
+                if chain_ids_resolved:
+                    from core.analyzer import interface_chain_pair, polymer_chain_ids
+                    if confidences is not None:
+                        pair_ids = [c for c in interface_chain_pair(confidences) if c]
+                        _polymers = set(polymer_chain_ids(confidences))
+                        nonpolymer_ids = [c for c in chain_ids_resolved if c not in _polymers]
+                    resnames = {}
+                    if nonpolymer_ids and cif_file.exists():
+                        try:
+                            import gemmi as _gemmi
+                            for _ch in _gemmi.read_structure(str(cif_file))[0]:
+                                if _ch.name in nonpolymer_ids and len(_ch) > 0:
+                                    resnames[_ch.name] = _ch[0].name
+                        except Exception:
+                            pass
+                    bait_acc, prey_acc = split_prediction_name(selected_pred_name)
+                    pair_labels = {}
+                    if prey_acc and len(pair_ids) == 2:
+                        # gene_cache stores '' for unresolved accessions, so
+                        # fall back to the name from the folder.
+                        pair_labels = {pair_ids[0]: gene_cache.get(bait_acc) or bait_acc,
+                                       pair_ids[1]: gene_cache.get(prey_acc) or prey_acc}
+                    protein_names = []
+                    for cid in chain_ids_resolved:
+                        if cid in pair_labels:
+                            protein_names.append(pair_labels[cid])
+                        elif cid in resnames:
+                            protein_names.append(f"{resnames[cid]} ({cid})")
+                        else:
+                            protein_names.append(f"Chain {cid}")
 
                 # Compute interface PAE (uses confidences already in memory — no re-read)
                 pae_data = None
@@ -316,12 +341,15 @@ def show_detailed(project_path: str, af3_folder: str):
                         chain_ids_all=chain_ids_resolved,
                         height=600,
                         model_format=model_format,
+                        nonpolymer_chains=nonpolymer_ids,
                     )
 
                 # Store everything in session state
                 st.session_state['_detail_model_key'] = model_key
                 st.session_state['_detail_confidences'] = confidences
                 st.session_state['_detail_chain_ids'] = chain_ids_resolved
+                st.session_state['_detail_pair_ids'] = pair_ids
+                st.session_state['_detail_pae_problem'] = pae_problem
                 st.session_state['_detail_chain_lengths'] = chain_lengths_resolved
                 st.session_state['_detail_protein_names'] = protein_names
                 st.session_state['_detail_cif_file'] = str(cif_file)
@@ -331,13 +359,19 @@ def show_detailed(project_path: str, af3_folder: str):
             # Retrieve from session state (instant — no recomputation)
             confidences = st.session_state.get('_detail_confidences')
             chain_ids_resolved = st.session_state.get('_detail_chain_ids', [])
+            pair_ids = st.session_state.get('_detail_pair_ids', chain_ids_resolved[:2])
             chain_lengths_resolved = st.session_state.get('_detail_chain_lengths', [])
             protein_names = st.session_state.get('_detail_protein_names', ['Chain A', 'Chain B'])
+            _name_of = dict(zip(chain_ids_resolved, protein_names))
+            pair_names = [_name_of.get(c, f"Chain {c}") for c in pair_ids]
             cif_file = Path(st.session_state.get('_detail_cif_file', ''))
             pae_data = st.session_state.get('_detail_pae_data')
             viewer_html = st.session_state.get('_detail_viewer_html')
 
             # Tabs for different analysis views
+            if st.session_state.get('_detail_pae_problem'):
+                st.warning(st.session_state['_detail_pae_problem'])
+
             tab0, tab1, tab2, tab3, tab5, tab4 = st.tabs(["3D Structure", "PAE Plots", "Interface Contacts", "Model Comparison", "PyMOL Scripts", "Export"])
 
             with tab0:
@@ -379,12 +413,11 @@ def show_detailed(project_path: str, af3_folder: str):
                         st.download_button("Download PAE plot", st.session_state[pae_plot_key],
                                            file_name=pae_fname, mime="image/png")
 
-                        if len(chain_ids_resolved) >= 2 and len(chain_indices) >= 2:
+                        if len(pair_ids) >= 2 and len(chain_indices) >= 2:
                             st.subheader("Interface Zoom")
-                            chain_a_name = protein_names[0]
-                            chain_b_name = protein_names[1]
-                            chain_a_idx = chain_indices[chain_ids_resolved[0]]
-                            chain_b_idx = chain_indices[chain_ids_resolved[1]]
+                            chain_a_name, chain_b_name = pair_names[0], pair_names[1]
+                            chain_a_idx = chain_indices[pair_ids[0]]
+                            chain_b_idx = chain_indices[pair_ids[1]]
 
                             zoom_plot_key = f"_zoom_plot_{model_key}"
                             if zoom_plot_key not in st.session_state:
@@ -472,11 +505,11 @@ def show_detailed(project_path: str, af3_folder: str):
                         # "Chain A/B", and identical labels (e.g. homodimers) get
                         # a chain-ID suffix, so the renamed DataFrame never has
                         # duplicate column names (which st.dataframe rejects).
-                        name_a = (protein_names[0] if len(protein_names) > 0 else "") or "Chain A"
-                        name_b = (protein_names[1] if len(protein_names) > 1 else "") or "Chain B"
+                        name_a = (pair_names[0] if len(pair_names) > 0 else "") or "Chain A"
+                        name_b = (pair_names[1] if len(pair_names) > 1 else "") or "Chain B"
                         if name_a == name_b:
-                            cid_a = chain_ids_resolved[0] if len(chain_ids_resolved) > 0 else "A"
-                            cid_b = chain_ids_resolved[1] if len(chain_ids_resolved) > 1 else "B"
+                            cid_a = pair_ids[0] if len(pair_ids) > 0 else "A"
+                            cid_b = pair_ids[1] if len(pair_ids) > 1 else "B"
                             name_a = f"{name_a} ({cid_a})"
                             name_b = f"{name_b} ({cid_b})"
                         col_rename = {
@@ -497,8 +530,8 @@ def show_detailed(project_path: str, af3_folder: str):
 
                         # Hub residues analysis
                         st.subheader("Hub Residues")
-                        name_a = protein_names[0] if len(protein_names) > 0 else "Chain A"
-                        name_b = protein_names[1] if len(protein_names) > 1 else "Chain B"
+                        name_a = pair_names[0] if len(pair_names) > 0 else "Chain A"
+                        name_b = pair_names[1] if len(pair_names) > 1 else "Chain B"
 
                         col1, col2 = st.columns(2)
                         with col1:
@@ -653,7 +686,7 @@ def show_detailed(project_path: str, af3_folder: str):
 
                 from core.pymol_script import generate_pymol_script
 
-                if cif_file.exists() and len(chain_ids_resolved) >= 2:
+                if cif_file.exists() and len(pair_ids) >= 2:
                     # Reuse PAE data (None for AlphaPulldown — no PAE tiers in script)
                     pae_data_pymol = pae_data
 
@@ -673,14 +706,14 @@ def show_detailed(project_path: str, af3_folder: str):
                     iface_result = st.session_state[iface_key]
                     contacts_pymol = iface_result.get('contacts', []) if iface_result else None
 
-                    name_a = protein_names[0] if len(protein_names) > 0 else chain_ids_resolved[0]
-                    name_b = protein_names[1] if len(protein_names) > 1 else chain_ids_resolved[1]
+                    name_a = pair_names[0] if len(pair_names) > 0 else pair_ids[0]
+                    name_b = pair_names[1] if len(pair_names) > 1 else pair_ids[1]
 
                     pymol_script = generate_pymol_script(
                         cif_path=str(cif_file.resolve()),
                         prediction_name=selected_pred_name,
-                        chain_a_id=chain_ids_resolved[0],
-                        chain_b_id=chain_ids_resolved[1],
+                        chain_a_id=pair_ids[0],
+                        chain_b_id=pair_ids[1],
                         protein_a_name=name_a,
                         protein_b_name=name_b,
                         interface_residues=pae_data_pymol,

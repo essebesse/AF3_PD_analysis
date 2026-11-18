@@ -179,6 +179,7 @@ def generate_viewer_html(
     chain_ids_all: Optional[List[str]] = None,
     height: int = 600,
     model_format: str = "cif",
+    nonpolymer_chains: Optional[List[str]] = None,
 ) -> str:
     """
     Generate HTML with 3Dmol.js viewer.
@@ -194,11 +195,19 @@ def generate_viewer_html(
 
     # Build style commands
     style_lines = []
+    ligands = set(nonpolymer_chains or [])
     for idx, chain_id in enumerate(all_chains):
         base_color = CHAIN_COLORS[idx % len(CHAIN_COLORS)]
+        if chain_id in ligands:
+            # Ligands and ions: sticks + small spheres (a cartoon needs a
+            # backbone; single-atom ions would otherwise be invisible)
+            style = {"stick": {"radius": 0.2, "color": base_color},
+                     "sphere": {"scale": 0.3, "color": base_color}}
+        else:
+            style = {"cartoon": {"color": base_color}}
         style_lines.append(
             f'    viewer.setStyle({_json.dumps({"chain": chain_id})},'
-            f'{_json.dumps({"cartoon": {"color": base_color}})});'
+            f'{_json.dumps(style)});'
         )
     if not all_chains:
         style_lines.append(

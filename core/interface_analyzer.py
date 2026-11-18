@@ -7,7 +7,7 @@ Based on spatial_interface_analysis.py and interface_analysis.py but generalized
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from core.analyzer import CIFParser, extract_chain_indices
+from core.analyzer import CIFParser, extract_chain_indices, _structure_pair
 
 
 def analyze_interface(cif_path: Path,
@@ -73,8 +73,7 @@ def analyze_interface(cif_path: Path,
             'summary': {}
         }
 
-    chain_a_id = chain_ids[0]
-    chain_b_id = chain_ids[1]
+    chain_a_id, chain_b_id = _structure_pair(chain_ids, confidences)
     chain_a_residues = parser.get_chain_residues(chain_a_id)
     chain_b_residues = parser.get_chain_residues(chain_b_id)
 

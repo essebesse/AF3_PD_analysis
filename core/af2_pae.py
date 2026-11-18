@@ -20,7 +20,7 @@ code paths (ipSAE, contacts, PAE plots, 3D PAE colouring) run unchanged.
 """
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -67,16 +67,24 @@ def load_af2_pae(pae_csv: Path) -> np.ndarray:
     column are 0-based residue indices)."""
     m = np.loadtxt(pae_csv, delimiter=",", skiprows=1)
     if m.ndim != 2 or m.shape[1] < 2:
-        raise ValueError(f"unexpected PAE CSV shape {m.shape} in {pae_csv}")
+        raise ValueError(f"unexpected PAE CSV shape {m.shape}")
     m = m[:, 1:]
     if m.shape[0] != m.shape[1]:
-        raise ValueError(f"PAE matrix not square ({m.shape}) in {pae_csv}")
+        raise ValueError(f"PAE matrix is {m.shape[0]}x{m.shape[1]}, not square")
     return m
 
 
 def load_af2_confidences(work_dir: Path, model_idx: int) -> Optional[Dict]:
     """AF3-shaped confidences dict for AF2 model ``ranked_<idx>``, or ``None``
-    when the PAE CSV or PDB is missing / unreadable.
+    when the PAE CSV or PDB is missing / unreadable. See
+    ``load_af2_confidences_checked`` for the reason."""
+    return load_af2_confidences_checked(work_dir, model_idx)[0]
+
+
+def load_af2_confidences_checked(work_dir: Path, model_idx: int) -> Tuple[Optional[Dict], Optional[str]]:
+    """``(confidences, problem)``. ``problem`` is a sentence for the user when
+    a ``ranked_<idx>_PAE.csv`` exists but cannot be used (the model then gets
+    the analysis without PAE); ``None`` when there is no PAE file or it loaded.
 
     One token per residue in PDB order (AF2 PAE is per residue). pLDDT is
     taken from the PDB B-factors, one value per heavy atom.
@@ -84,15 +92,14 @@ def load_af2_confidences(work_dir: Path, model_idx: int) -> Optional[Dict]:
     pae_csv = af2_pae_file(work_dir, model_idx)
     pdb = work_dir / f"ranked_{model_idx}.pdb"
     if pae_csv is None or not pdb.is_file():
-        return None
+        return None, None
     try:
         pae = load_af2_pae(pae_csv)
         structure = gemmi.read_structure(str(pdb))
     except Exception as e:
-        print(f"AF2: could not read {pae_csv.name} / {pdb.name}: {e}")
-        return None
+        return None, f"{pae_csv.name} could not be used ({e}); analysed without PAE."
     if len(structure) == 0:
-        return None
+        return None, f"{pdb.name} contains no model; analysed without PAE."
 
     token_chain_ids, token_res_ids, atom_plddts = [], [], []
     for chain in structure[0]:
@@ -106,13 +113,12 @@ def load_af2_confidences(work_dir: Path, model_idx: int) -> Optional[Dict]:
                     atom_plddts.append(float(atom.b_iso))
 
     if len(token_chain_ids) != pae.shape[0]:
-        print(f"AF2: {pdb.name} has {len(token_chain_ids)} residues but "
-              f"{pae_csv.name} is {pae.shape[0]}x{pae.shape[1]}; skipping")
-        return None
+        return None, (f"{pae_csv.name} is {pae.shape[0]}x{pae.shape[1]} but {pdb.name} has "
+                      f"{len(token_chain_ids)} residues; analysed without PAE.")
 
     return {
         "pae": pae.tolist(),   # list of lists, same as AF3 confidences.json
         "token_chain_ids": token_chain_ids,
         "token_res_ids": token_res_ids,
         "atom_plddts": atom_plddts,
-    }
+    }, None

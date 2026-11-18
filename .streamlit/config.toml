@@ -1,5 +1,8 @@
 [server]
 enableStaticServing = true
+# Newer Streamlit asks for an e-mail address on first run and exits when
+# started without a terminal; never ask.
+showEmailPrompt = false
 
 [client]
 showSidebarNavigation = false

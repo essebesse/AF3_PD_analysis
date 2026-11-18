@@ -216,6 +216,13 @@ def show_results(project_path: str, af3_folder: str):
         display_data.append(row)
 
     df = pd.DataFrame(display_data)
+
+    # Models whose PAE file existed but could not be used (AF2 input)
+    warned = [r for r in filtered_results if r.get('warning')]
+    if warned:
+        st.warning(f"{len(warned)} model(s) were analysed without PAE because their PAE "
+                   f"file could not be used. First: {warned[0].get('prediction_name', '')}: "
+                   f"{warned[0]['warning']}")
     if has_spatial:
         st.caption("Cβ≤8 = spatial Cβ–Cβ contacts < 8 Å (AlphaPulldown / AF2-multimer; no PAE filter).")
 

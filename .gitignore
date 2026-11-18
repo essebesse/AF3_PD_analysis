@@ -43,3 +43,4 @@ slurm_config.toml
 _slurm_chunk_*.txt
 _slurm_results_*.json
 af3_app_analysis.json
+af3_app_analysis_summary.txt

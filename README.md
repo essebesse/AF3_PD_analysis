@@ -25,7 +25,7 @@ Open `http://localhost:8501`, enter the full path to
 (Load Data, Analyze, Results, Detailed Analysis). A step-by-step guide is in
 [AF3_PD_USER_GUIDE.md](AF3_PD_USER_GUIDE.md).
 
-Tested with Python 3.10 and 3.11 on Linux (on Python 3.10 the `tomli`
+Tested with Python 3.10, 3.11 and 3.12 on Linux (on Python 3.10 the `tomli`
 package is installed for reading the optional SLURM settings).
 
 ## Features
@@ -46,7 +46,7 @@ package is installed for reading the optional SLURM settings).
 It is recommended to use an isolated Python environment. Either `venv` or
 `conda` works; pick whichever your site supports.
 
-### Option 1: venv (Python 3.10 or 3.11)
+### Option 1: venv (Python 3.10 to 3.12)
 
 ```bash
 # Clone the repository

@@ -263,10 +263,61 @@ def extract_chain_indices(confidences: Dict) -> Tuple[List[int], List[int], List
         all_indices.append(i)
         chain_indices[chain].append(i)
 
-    chain_a = chain_indices.get(unique_chains[0], []) if len(unique_chains) > 0 else []
-    chain_b = chain_indices.get(unique_chains[1], []) if len(unique_chains) > 1 else []
+    a_id, b_id = interface_chain_pair(confidences)
+    chain_a = chain_indices.get(a_id, []) if a_id else []
+    chain_b = chain_indices.get(b_id, []) if b_id else []
 
     return all_indices, chain_a, chain_b, chain_indices
+
+
+def polymer_chain_ids(confidences: Dict) -> List[str]:
+    """Chain IDs (in token order) of polymer chains (protein, DNA, RNA).
+
+    AF3 uses one token per residue for polymers and one token per atom for
+    ligands and ions, so a ligand chain has all tokens on one residue number
+    and an ion a single token. A chain counts as a polymer when its tokens
+    span more than one residue number. Without token_res_ids (not expected)
+    every chain is treated as a polymer.
+    """
+    chains = confidences.get('token_chain_ids', [])
+    res_ids = confidences.get('token_res_ids', [])
+    order: List[str] = []
+    residues: Dict[str, set] = {}
+    for i, c in enumerate(chains):
+        if c not in residues:
+            order.append(c)
+            residues[c] = set()
+        if i < len(res_ids):
+            residues[c].add(res_ids[i])
+    if not res_ids:
+        return order
+    return [c for c in order if len(residues[c]) > 1]
+
+
+def interface_chain_pair(confidences: Dict) -> Tuple[Optional[str], Optional[str]]:
+    """The two chains whose interface is scored: the first two polymer chains.
+
+    Ligand and ion chains are skipped, so a ligand entered before the
+    proteins is never scored as the bait. Falls back to the first two chains
+    of any kind when there are fewer than two polymer chains.
+    """
+    pair = polymer_chain_ids(confidences)
+    if len(pair) < 2:
+        pair = list(dict.fromkeys(confidences.get('token_chain_ids', [])))
+    a = pair[0] if len(pair) > 0 else None
+    b = pair[1] if len(pair) > 1 else None
+    return a, b
+
+
+def _structure_pair(parser_chain_ids: List[str], confidences: Dict) -> Tuple[Optional[str], Optional[str]]:
+    """Chain pair to analyse in a parsed structure: the scored pair from the
+    confidences when both chains are present, else the first two chains."""
+    a, b = interface_chain_pair(confidences)
+    if a in parser_chain_ids and b in parser_chain_ids:
+        return a, b
+    if len(parser_chain_ids) >= 2:
+        return parser_chain_ids[0], parser_chain_ids[1]
+    return None, None
 
 
 def calculate_interface_contacts(cif_path: Path, confidences: Dict,
@@ -296,8 +347,7 @@ def calculate_interface_contacts(cif_path: Path, confidences: Dict,
     if not chain_a_indices or not chain_b_indices:
         return []
 
-    chain_a_id = chain_ids[0]
-    chain_b_id = chain_ids[1]
+    chain_a_id, chain_b_id = _structure_pair(chain_ids, confidences)
     chain_a_residues = parser.get_chain_residues(chain_a_id)
     chain_b_residues = parser.get_chain_residues(chain_b_id)
 
@@ -356,7 +406,7 @@ def _pae_interface_metrics(struct_path: Optional[Path], confidences: Dict,
     if len(chain_ids) < 2:
         return 0, 0, 0, 0.0
 
-    chain_a_id, chain_b_id = chain_ids[0], chain_ids[1]
+    chain_a_id, chain_b_id = _structure_pair(chain_ids, confidences)
     chain_a_res = parser.get_chain_residues(chain_a_id)
     chain_b_res = parser.get_chain_residues(chain_b_id)
 
@@ -724,7 +774,7 @@ def _analyze_alphapulldown(pred_dir: Path, top_only: bool = False,
     * without it: spatial contacts (Cβ–Cβ < 8 Å) and interface pLDDT (mean
       B-factor of interface Cβ atoms) only, ``format='alphapulldown'``.
     """
-    from core.af2_pae import af2_work_dir, load_af2_confidences
+    from core.af2_pae import af2_work_dir, load_af2_confidences_checked
 
     work_dir = af2_work_dir(pred_dir)
     if work_dir is None:
@@ -752,7 +802,7 @@ def _analyze_alphapulldown(pred_dir: Path, top_only: bool = False,
         if not pdb_path.is_file():
             continue
 
-        confidences = load_af2_confidences(work_dir, idx)
+        confidences, pae_problem = load_af2_confidences_checked(work_dir, idx)
         if confidences is not None:
             r = _analyze_af2_with_pae(pdb_path, confidences, ipsae_pae_cutoff)
             if r is not None:
@@ -792,6 +842,7 @@ def _analyze_alphapulldown(pred_dir: Path, top_only: bool = False,
             'prediction_name': pred_name,
             'format': 'alphapulldown',
             'model_key': model_key,
+            'warning': pae_problem,   # set when a PAE CSV exists but could not be used
         })
 
     return results
