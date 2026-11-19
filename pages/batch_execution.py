@@ -265,7 +265,7 @@ def write_summary_txt(results: list, out_path: Path, pae_cutoff: float, analyze_
     models_label = "all models" if analyze_all else "top-ranked model only"
 
     lines = []
-    lines.append("AF3 Pulldown Analysis - App Summary")
+    lines.append("PulldownRanker - App Summary")
     lines.append("=" * 60)
     lines.append(f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"ipSAE PAE Cutoff: {pae_cutoff}Å")

@@ -1,5 +1,5 @@
 """
-AF3 Pulldown Analysis Web App - Main Entry Point
+PulldownRanker - Main Entry Point
 
 A Streamlit-based GUI for analyzing AlphaFold3 pulldown prediction data.
 Provides a modern interface for running analysis scripts, viewing results
@@ -12,7 +12,7 @@ from pathlib import Path
 
 # Page configuration (must be first)
 st.set_page_config(
-    page_title="AF3 Pulldown Analysis",
+    page_title="PulldownRanker",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -31,7 +31,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # App title
-st.markdown('<div class="main-header">🔬 AF3 Pulldown Analysis</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">🔬 PulldownRanker</div>', unsafe_allow_html=True)
 st.markdown("### Web-based analysis for AlphaFold 3 protein interaction predictions")
 
 # Check if core modules exist

@@ -1,5 +1,5 @@
 """
-Core Analysis Module for AF3 Pulldown Analysis App
+Core Analysis Module for PulldownRanker
 
 Extracts and adapts core analysis functions from AF3_PD_analysis_v4.py
 to analyze ALL models (not just top-ranked) in AF3 prediction directories.

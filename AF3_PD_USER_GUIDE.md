@@ -1,4 +1,4 @@
-# AF3 Pulldown Analysis App: User Guide
+# PulldownRanker: User Guide
 
 Step-by-step instructions for analysing pulldown-style structure predictions
 (one bait against many preys) with this web app. Installation is described in

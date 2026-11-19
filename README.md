@@ -1,4 +1,4 @@
-# AF3 / AlphaPulldown Analysis Web App
+# PulldownRanker
 
 A browser-based app (Streamlit) for analysing pulldown-style screens of
 protein–protein structure predictions, where one bait protein is predicted

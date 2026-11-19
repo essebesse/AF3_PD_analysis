@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A Streamlit web app for analyzing protein–protein structure prediction pulldown data.
+PulldownRanker: a Streamlit web app for analyzing protein–protein structure prediction pulldown data.
 
 Supported input formats (auto-detected per folder):
 

@@ -1,4 +1,4 @@
-# AF3 Pulldown Analysis Web App Dependencies
+# PulldownRanker dependencies
 streamlit>=1.30
 pandas
 numpy
