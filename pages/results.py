@@ -12,7 +12,7 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.scanner import AF3Scanner
-from core.utils import format_score, calculate_confidence_tier, tier_color, split_prediction_name, normalize_cache_records
+from core.utils import TABLE_H, format_score, calculate_confidence_tier, tier_color, split_prediction_name, normalize_cache_records
 
 
 def show_results(project_path: str, af3_folder: str):
@@ -232,6 +232,7 @@ def show_results(project_path: str, af3_folder: str):
         df,
         width='stretch',
         hide_index=True,
+        height=TABLE_H,
         on_select="rerun",
         selection_mode="single-row",
         column_config={

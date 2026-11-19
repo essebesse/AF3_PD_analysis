@@ -59,6 +59,11 @@ def split_prediction_name(name: str) -> Tuple[str, str]:
     return s.upper(), ''
 
 
+# Height of long st.dataframe tables: header + 10 whole rows (35 px each,
+# + 3 px border), so the last visible row is not cut in half.
+TABLE_H = 35 * 11 + 3
+
+
 def format_score(value: float, decimals: int = 3) -> str:
     """Format a score value for display."""
     if value is None:

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.scanner import AF3Scanner, load_prediction_data
-from core.utils import format_score, split_prediction_name
+from core.utils import TABLE_H, format_score, split_prediction_name
 
 
 def show_detailed(project_path: str, af3_folder: str):
@@ -532,7 +532,7 @@ def show_detailed(project_path: str, af3_folder: str):
                                  if c in contact_df.columns]
                         contact_df = contact_df[order + [c for c in contact_df.columns if c not in order]]
                         contact_df = contact_df.rename(columns=col_rename)
-                        st.dataframe(contact_df, width='stretch', hide_index=True)
+                        st.dataframe(contact_df, width='stretch', hide_index=True, height=TABLE_H)
 
                         # Hub residues analysis
                         st.subheader("Hub Residues")

@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.scanner import AF3Scanner
-from core.utils import format_score, split_prediction_name, normalize_cache_records
+from core.utils import TABLE_H, format_score, split_prediction_name, normalize_cache_records
 
 
 @st.cache_data(ttl=300)
@@ -122,7 +122,7 @@ def show_load_data(project_path: str, af3_folder: str):
                     'Ranking Score': format_score(r.get('ranking_score', 0)),
                 })
             df_preview = pd.DataFrame(display_data)
-            st.dataframe(df_preview, width='stretch', hide_index=True)
+            st.dataframe(df_preview, width='stretch', hide_index=True, height=TABLE_H)
             st.caption(f"Top 20 of {len(per_pred)} predictions by iPTM.")
 
         with tab_full:
