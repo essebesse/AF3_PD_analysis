@@ -309,6 +309,30 @@ def interface_chain_pair(confidences: Dict) -> Tuple[Optional[str], Optional[str
     return a, b
 
 
+def chain_pair_fields(confidences: Dict, summary: Dict) -> Dict:
+    """Which chains a record scores, for display.
+
+    ipSAE, iPLDDT and contacts are for the scored pair only, while the
+    summary iPTM covers the whole complex. With more than two polymer chains
+    (e.g. a 2:2 job, where A and B are both copies of the first protein) the
+    pair's own iPTM comes from chain_pair_iptm.
+    """
+    a, b = interface_chain_pair(confidences)
+    chains = list(dict.fromkeys(confidences.get('token_chain_ids', [])))
+    fields = {
+        'chain_pair': f"{a}:{b}" if a and b else None,
+        'n_chains': len(polymer_chain_ids(confidences)),
+        'pair_iptm': None,
+    }
+    cpi = summary.get('chain_pair_iptm')
+    if cpi and a in chains and b in chains:
+        try:
+            fields['pair_iptm'] = float(cpi[chains.index(a)][chains.index(b)])
+        except (IndexError, TypeError, ValueError):
+            pass
+    return fields
+
+
 def _structure_pair(parser_chain_ids: List[str], confidences: Dict) -> Tuple[Optional[str], Optional[str]]:
     """Chain pair to analyse in a parsed structure: the scored pair from the
     confidences when both chains are present, else the first two chains."""
@@ -561,6 +585,7 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
             'pae_mean': float(np.mean(pae_matrix)) if pae_matrix.size > 0 else 0,
             'sequences': sequences,
             'format': 'af3',
+            **chain_pair_fields(confidences, summary),
         }
 
     except Exception as e:
@@ -756,6 +781,7 @@ def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
             'pae_mean': float(np.mean(pae_matrix)) if pae_matrix.size > 0 else 0,
             'cif_path': str(cif_path) if cif_path.exists() else None,
             'format': 'server_flat',
+            **chain_pair_fields(confidences, summary),
         }
 
     except Exception as e:

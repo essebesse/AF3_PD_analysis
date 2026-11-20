@@ -180,6 +180,10 @@ def show_results(project_path: str, af3_folder: str):
     # aren't left with empty contact columns. AF3-only datasets keep the old layout.
     has_spatial = any(r.get('contacts_spatial') is not None for r in filtered_results)
 
+    # Complexes with more than two chains: interface metrics cover only the
+    # scored pair, so show which pair and that pair's own iPTM.
+    multi_chain = [r for r in filtered_results if (r.get('n_chains') or 0) > 2]
+
     display_data = []
     # Keep mapping from display row index to prediction name
     row_to_pred = []
@@ -203,14 +207,21 @@ def show_results(project_path: str, af3_folder: str):
             'Bait': bait_label,
             'Prey': prey_label,
             'Model': model_label,
-            'iPTM': format_score(r['iptm']),
+        }
+        if multi_chain:
+            n = r.get('n_chains') or 0
+            row['Chains'] = f"{r['chain_pair']} of {n}" if r.get('chain_pair') and n > 2 else (r.get('chain_pair') or "-")
+        row['iPTM'] = format_score(r['iptm'])
+        if multi_chain:
+            row['Pair iPTM'] = format_score(r['pair_iptm']) if r.get('pair_iptm') is not None else "-"
+        row.update({
             'ipSAE': format_score(r.get('ipsae')) if r.get('ipsae') is not None else "-",
             'Ranking Score': format_score(r['ranking_score']),
             'iPLDDT': format_score(r.get('interface_plddt')) if r.get('interface_plddt') is not None else "-",
             'PAE≤3': _contact('contacts_pae3'),
             'PAE≤5': _contact('contacts_pae5'),
             'PAE≤8': _contact('contacts_pae8'),
-        }
+        })
         if has_spatial:
             row['Cβ≤8'] = _contact('contacts_spatial')
         display_data.append(row)
@@ -225,6 +236,14 @@ def show_results(project_path: str, af3_folder: str):
                    f"{warned[0]['warning']}")
     if has_spatial:
         st.caption("Cβ≤8 = spatial Cβ–Cβ contacts < 8 Å (AlphaPulldown / AF2-multimer; no PAE filter).")
+    if multi_chain:
+        n_preds = len({r['prediction_name'] for r in multi_chain})
+        st.warning(
+            f"{n_preds} prediction(s) have more than two chains. ipSAE, iPLDDT, contacts and "
+            "Pair iPTM are for the chain pair in the Chains column only (the first two "
+            "protein chains); iPTM is for the whole complex. In a job with several copies "
+            "of a protein, A and B may be two copies of the same protein."
+        )
 
     # Display with row selection — click a row to go to Detailed Analysis
     st.caption("Click a row to select it for detailed analysis")
@@ -237,6 +256,7 @@ def show_results(project_path: str, af3_folder: str):
         selection_mode="single-row",
         column_config={
             "Model": st.column_config.TextColumn(width="small"),
+            "Chains": st.column_config.TextColumn(width="small"),
             "PAE≤3": st.column_config.NumberColumn(width="small"),
             "PAE≤5": st.column_config.NumberColumn(width="small"),
             "PAE≤8": st.column_config.NumberColumn(width="small"),
