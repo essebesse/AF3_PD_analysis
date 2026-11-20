@@ -22,6 +22,8 @@ Computes confidence metrics across **all 5 seed/sample models per prediction**, 
 
 **Record schema.** Every scan entry, prediction summary and result record has `format` (`af3`, `server_flat`, `af2`, `alphapulldown`). AF2 models whose PAE CSV exists but cannot be used carry `warning` (shown on Results and Detailed Analysis). AF3 local and Server records also carry `chain_pair` (e.g. `A:B`), `n_chains` (polymer chains) and `pair_iptm` (`chain_pair_iptm` for the scored pair, via `chain_pair_fields()`); Results shows Chains / Pair iPTM columns and a warning only when some record has more than two chains. Caches written before this lack the fields and show nothing until re-analysed.
 
+**Planned next: all chain pairs.** Only the first polymer pair is scored now. Plan for automatic chain detection and evaluation of every cross-chain interface: `ROADMAP.md`.
+
 `example_data/IFT27_pulldown/` (two small AF3 pairs) is for first runs and regression checks. `validation/ipsae_vs_reference.py` compares ipSAE with Dunbrack's `ipsae.py` (agreement < 5e-7).
 
 ## Running the App
