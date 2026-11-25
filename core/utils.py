@@ -23,7 +23,7 @@ def is_valid_uniprot_accession(acc: str) -> bool:
 
 
 def normalize_cache_records(records: list) -> list:
-    """Backfill missing iPTM/PTM/ranking_score on legacy cache records.
+    """Backfill missing iPTM/PTM/ranking_score and ``pairs`` on legacy cache records.
 
     Some pre-existing caches (``format: 'af2'`` from earlier analyzers) store
     only the combined ``iptm_ptm`` and leave ``iptm`` / ``ptm`` / ``ranking_score``
@@ -39,6 +39,15 @@ def normalize_cache_records(records: list) -> list:
             r['ptm'] = float(combined) if combined is not None else 0.0
         if r.get('ranking_score') is None:
             r['ranking_score'] = float(combined) if combined is not None else float(r.get('iptm') or 0.0)
+        if 'pairs' not in r:
+            # Written before all chain pairs were scored: the one scored pair
+            r['pairs'] = [{
+                'chains': r.get('chain_pair'),
+                'role': 'bait-prey',
+                'entities': None,
+                **{k: r.get(k) for k in ('ipsae', 'pair_iptm', 'contacts_pae3', 'contacts_pae5',
+                                         'contacts_pae8', 'contacts_spatial', 'interface_plddt')},
+            }]
     return records
 
 

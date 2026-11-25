@@ -17,9 +17,10 @@ from core.utils import TABLE_H, format_score, split_prediction_name, normalize_c
 
 @st.cache_data(ttl=300)
 def cached_fast_scan(af3_folder: str):
-    """Fast scan: just lists directories, no file I/O."""
+    """Fast scan: lists directories, reads no prediction files.
+    Returns (predictions, folders without prediction output, same-name pairs)."""
     scanner = AF3Scanner(Path(af3_folder))
-    return scanner.scan()
+    return scanner.scan(), scanner.skipped, scanner.duplicates
 
 
 def show_load_data(project_path: str, af3_folder: str):
@@ -32,11 +33,25 @@ def show_load_data(project_path: str, af3_folder: str):
         return
 
     # Instant: just list directories
-    predictions = cached_fast_scan(str(af3_folder))
+    predictions, skipped, duplicates = cached_fast_scan(str(af3_folder))
     total = len(predictions)
 
+    if duplicates:
+        st.error(f"{len(duplicates)} prediction name(s) occur in more than one folder below the "
+                 "selected folder; their results would be mixed up. Select a folder that holds "
+                 "only one of each, or rename one. First: "
+                 f"`{duplicates[0][0]}` and `{duplicates[0][1]}`")
+
+    if skipped:
+        shown = ", ".join(skipped[:10]) + (f" and {len(skipped) - 10} more" if len(skipped) > 10 else "")
+        st.caption(f"{len(skipped)} folder(s) without prediction output were skipped "
+                   f"(unfinished runs, logs, MSAs): {shown}")
+
     if total == 0:
-        st.warning("No prediction directories found.")
+        st.warning("No prediction folders found. A prediction folder holds AF3 output "
+                   "(ranking_scores.csv, summary_confidences.json or seed-N_sample-M/), "
+                   "AF3 Server files (*_model_N.cif) or AF2 files (ranked_N.pdb), "
+                   "up to 4 levels below the selected folder.")
         return
 
     import pandas as pd

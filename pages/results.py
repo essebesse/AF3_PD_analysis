@@ -14,6 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.scanner import AF3Scanner
 from core.utils import TABLE_H, format_score, calculate_confidence_tier, tier_color, split_prediction_name, normalize_cache_records
 
+# The three roles a scored chain pair can have
+PAIR_ROLES = ['bait-prey', 'bait-bait', 'prey-prey']
+
 
 def show_results(project_path: str, af3_folder: str):
     """Display the Results page."""
@@ -184,25 +187,41 @@ def show_results(project_path: str, af3_folder: str):
     # scored pair, so show which pair and that pair's own iPTM.
     multi_chain = [r for r in filtered_results if (r.get('n_chains') or 0) > 2]
 
+    # Records with several scored chain pairs enable the per-pair view and
+    # the 'Chain pairs' Excel sheet.
+    multi_pair = any(len(r.get('pairs') or []) > 1 for r in filtered_results)
+
+    # Optional one-row-per-chain-pair view (only when pairs were scored per pair)
+    pair_view = st.toggle("One row per chain pair") if multi_pair else False
+    selected_roles = []
+    if pair_view:
+        selected_roles = st.multiselect("Roles:", PAIR_ROLES, default=['bait-prey'])
+
+    def _row_labels(r):
+        """Bait/prey/model labels shared by the per-model and per-pair tables."""
+        model_label = "Top" if r.get('is_top_ranked') else f"s{r['seed']}-m{r['sample']}"
+        bait_acc, prey_acc = split_prediction_name(r['prediction_name'])
+        bait_gene = gene_cache.get(bait_acc, '')
+        prey_gene = gene_cache.get(prey_acc, '')
+        bait_label = f"{bait_gene} ({bait_acc})" if bait_gene else bait_acc
+        prey_label = f"{prey_gene} ({prey_acc})" if prey_gene else prey_acc
+        return bait_label, prey_label, model_label
+
+    def _fmt_contact(value):
+        return int(value) if value is not None else "-"
+
+    def _fmt_score(value):
+        return format_score(value) if value is not None else "-"
+
+    # Default view: one row per model showing the summary pair. Always built;
+    # also used for the Excel 'Models' sheet when the per-pair view is active.
     display_data = []
     # Keep mapping from display row index to prediction name
     row_to_pred = []
     for r in filtered_results:
-        model_label = "Top" if r.get('is_top_ranked') else f"s{r['seed']}-m{r['sample']}"
+        bait_label, prey_label, model_label = _row_labels(r)
 
-        pred_name = r['prediction_name']
-        bait_acc, prey_acc = split_prediction_name(pred_name)
-        bait_gene = gene_cache.get(bait_acc, '')
-        prey_gene = gene_cache.get(prey_acc, '')
-        # Always show gene name (if available) followed by UniProt ID
-        bait_label = f"{bait_gene} ({bait_acc})" if bait_gene else bait_acc
-        prey_label = f"{prey_gene} ({prey_acc})" if prey_gene else prey_acc
-
-        def _contact(key):
-            v = r.get(key)
-            return int(v) if v is not None else "-"
-
-        row_to_pred.append(pred_name)
+        row_to_pred.append(r['prediction_name'])
         row = {
             'Bait': bait_label,
             'Prey': prey_label,
@@ -211,6 +230,7 @@ def show_results(project_path: str, af3_folder: str):
         if multi_chain:
             n = r.get('n_chains') or 0
             row['Chains'] = f"{r['chain_pair']} of {n}" if r.get('chain_pair') and n > 2 else (r.get('chain_pair') or "-")
+            row['Role'] = r.get('pair_role') or "-"
         row['iPTM'] = format_score(r['iptm'])
         if multi_chain:
             row['Pair iPTM'] = format_score(r['pair_iptm']) if r.get('pair_iptm') is not None else "-"
@@ -218,15 +238,101 @@ def show_results(project_path: str, af3_folder: str):
             'ipSAE': format_score(r.get('ipsae')) if r.get('ipsae') is not None else "-",
             'Ranking Score': format_score(r['ranking_score']),
             'iPLDDT': format_score(r.get('interface_plddt')) if r.get('interface_plddt') is not None else "-",
-            'PAE≤3': _contact('contacts_pae3'),
-            'PAE≤5': _contact('contacts_pae5'),
-            'PAE≤8': _contact('contacts_pae8'),
+            'PAE≤3': _fmt_contact(r.get('contacts_pae3')),
+            'PAE≤5': _fmt_contact(r.get('contacts_pae5')),
+            'PAE≤8': _fmt_contact(r.get('contacts_pae8')),
         })
         if has_spatial:
-            row['Cβ≤8'] = _contact('contacts_spatial')
+            row['Cβ≤8'] = _fmt_contact(r.get('contacts_spatial'))
         display_data.append(row)
 
-    df = pd.DataFrame(display_data)
+    models_df = pd.DataFrame(display_data)
+
+    df = models_df
+    if pair_view:
+        # One row per scored chain pair: metrics from the pair entry, iPTM,
+        # Ranking Score, Model, Bait and Prey from the record.
+        pair_entries = []
+        for r in filtered_results:
+            bait_label, prey_label, model_label = _row_labels(r)
+            for p in (r.get('pairs') or []):
+                if selected_roles and p.get('role') not in selected_roles:
+                    continue
+                pair_entries.append((r, p, bait_label, prey_label, model_label))
+
+        # Same sort choice as the model table, applied to the pair values
+        # (ipSAE, iPLDDT and contacts are pair-level; iPTM and Ranking Score
+        # are whole-complex record values)
+        def _pair_sort_value(entry):
+            rec, pair = entry[0], entry[1]
+            if sort_key in ('ipsae', 'interface_plddt', 'contacts_pae5'):
+                return pair.get(sort_key) or 0
+            return rec.get(sort_key) or 0
+
+        pair_entries.sort(key=_pair_sort_value, reverse=True)
+
+        pair_rows = []
+        pair_row_to_pred = []
+        for rec, p, bait_label, prey_label, model_label in pair_entries:
+            pair_row_to_pred.append(rec['prediction_name'])
+            row = {
+                'Bait': bait_label,
+                'Prey': prey_label,
+                'Model': model_label,
+                'Chains': p.get('chains') or "-",
+                'Role': p.get('role') or "-",
+                'iPTM': format_score(rec['iptm']),
+                'Pair iPTM': _fmt_score(p.get('pair_iptm')),
+                'ipSAE': _fmt_score(p.get('ipsae')),
+                'ipSAE A>B': _fmt_score(p.get('ipsae_ab')),
+                'ipSAE B>A': _fmt_score(p.get('ipsae_ba')),
+                'Ranking Score': format_score(rec['ranking_score']),
+                'iPLDDT': _fmt_score(p.get('interface_plddt')),
+                'PAE≤3': _fmt_contact(p.get('contacts_pae3')),
+                'PAE≤5': _fmt_contact(p.get('contacts_pae5')),
+                'PAE≤8': _fmt_contact(p.get('contacts_pae8')),
+            }
+            if has_spatial:
+                row['Cβ≤8'] = _fmt_contact(p.get('contacts_spatial'))
+            pair_rows.append(row)
+
+        df = pd.DataFrame(pair_rows)
+        row_to_pred = pair_row_to_pred
+
+    # All scored pairs of all filtered models (no role filter), for the
+    # Excel 'Chain pairs' sheet
+    chain_pairs_df = None
+    if multi_pair:
+        has_pair_spatial = has_spatial or any(
+            p.get('contacts_spatial') is not None
+            for r in filtered_results
+            for p in (r.get('pairs') or [])
+        )
+        pair_export_rows = []
+        for r in filtered_results:
+            bait_label, prey_label, model_label = _row_labels(r)
+            for p in (r.get('pairs') or []):
+                export_row = {
+                    'Bait': bait_label,
+                    'Prey': prey_label,
+                    'Model': model_label,
+                    'Chains': p.get('chains') or "-",
+                    'Role': p.get('role') or "-",
+                    'Entities': p.get('entities') or "-",
+                    'Bait chains': ', '.join(r.get('bait_chains') or []),
+                    'ipSAE': _fmt_score(p.get('ipsae')),
+                    'ipSAE A>B': _fmt_score(p.get('ipsae_ab')),
+                    'ipSAE B>A': _fmt_score(p.get('ipsae_ba')),
+                    'Pair iPTM': _fmt_score(p.get('pair_iptm')),
+                    'iPLDDT': _fmt_score(p.get('interface_plddt')),
+                    'PAE≤3': _fmt_contact(p.get('contacts_pae3')),
+                    'PAE≤5': _fmt_contact(p.get('contacts_pae5')),
+                    'PAE≤8': _fmt_contact(p.get('contacts_pae8')),
+                }
+                if has_pair_spatial:
+                    export_row['Cβ≤8'] = _fmt_contact(p.get('contacts_spatial'))
+                pair_export_rows.append(export_row)
+        chain_pairs_df = pd.DataFrame(pair_export_rows)
 
     # Models whose PAE file existed but could not be used (AF2 input)
     warned = [r for r in filtered_results if r.get('warning')]
@@ -238,12 +344,17 @@ def show_results(project_path: str, af3_folder: str):
         st.caption("Cβ≤8 = spatial Cβ–Cβ contacts < 8 Å (AlphaPulldown / AF2-multimer; no PAE filter).")
     if multi_chain:
         n_preds = len({r['prediction_name'] for r in multi_chain})
-        st.warning(
-            f"{n_preds} prediction(s) have more than two chains. ipSAE, iPLDDT, contacts and "
-            "Pair iPTM are for the chain pair in the Chains column only (the first two "
-            "protein chains); iPTM is for the whole complex. In a job with several copies "
-            "of a protein, A and B may be two copies of the same protein."
+        info_text = (
+            f"{n_preds} prediction(s) have more than two protein chains. Every chain pair is scored. "
+            "In the one-row-per-model view, ipSAE, iPLDDT, contacts and Pair iPTM are for the summary "
+            "pair: the bait-prey pair with the highest ipSAE (bait chains: chain A and its copies; "
+            "with _with_ in the folder name all chains except the last protein; or as set on the "
+            "Analyze page). iPTM is for the whole complex."
         )
+        bait_override = next((r.get('bait_override') for r in filtered_results if r.get('bait_override')), None)
+        if bait_override:
+            info_text += f" Bait chains overridden: {bait_override}"
+        st.info(info_text)
 
     # Display with row selection — click a row to go to Detailed Analysis
     st.caption("Click a row to select it for detailed analysis")
@@ -257,12 +368,13 @@ def show_results(project_path: str, af3_folder: str):
         column_config={
             "Model": st.column_config.TextColumn(width="small"),
             "Chains": st.column_config.TextColumn(width="small"),
+            "Role": st.column_config.TextColumn(width="small"),
             "PAE≤3": st.column_config.NumberColumn(width="small"),
             "PAE≤5": st.column_config.NumberColumn(width="small"),
             "PAE≤8": st.column_config.NumberColumn(width="small"),
             "Cβ≤8": st.column_config.NumberColumn(width="small"),
         },
-        key="results_table"
+        key="results_pairs_table" if pair_view else "results_table"
     )
 
     # Handle row selection
@@ -298,7 +410,12 @@ def show_results(project_path: str, af3_folder: str):
         try:
             import io
             buffer = io.BytesIO()
-            df.to_excel(buffer, index=False, engine='openpyxl')
+            # 'Models' always holds the per-model table; datasets with
+            # multi-pair models additionally get every scored chain pair.
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                models_df.to_excel(writer, sheet_name='Models', index=False)
+                if chain_pairs_df is not None:
+                    chain_pairs_df.to_excel(writer, sheet_name='Chain pairs', index=False)
             buffer.seek(0)
             st.download_button(
                 label="Download XLSX",

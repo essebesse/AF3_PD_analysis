@@ -4,6 +4,7 @@ Page 3: Detailed Analysis - Per-Prediction Deep Dive
 PAE plots, interface contacts, hub residues, and model comparison.
 """
 
+import io
 import streamlit as st
 import os
 import sys
@@ -204,6 +205,9 @@ def show_detailed(project_path: str, af3_folder: str):
             from core.viewer_3d import generate_viewer_html, compute_interface_pae_per_residue
 
             pred_dir = Path(selected_pred['prediction_dir'])
+            # Prefix of the AF3 file names; differs from the folder name if renamed
+            from core.scanner import prediction_file_prefix
+            file_prefix = prediction_file_prefix(pred_dir)
             # AF2 ranked_N.pdb may sit in pred_dir/seq/
             _is_af2 = selected_pred.get('format') in ('alphapulldown', 'af2')
             struct_dir = pred_dir
@@ -214,25 +218,32 @@ def show_detailed(project_path: str, af3_folder: str):
             # ── Compute everything ONCE per model, store in session state ──
             model_key = f"{selected_pred_name}_{seed}_{sample}"
             if st.session_state.get('_detail_model_key') != model_key:
-                # Model changed — drop old cached plots/data by exact key,
-                # not substring (which would cross-clear predictions whose
-                # names share a prefix).
+                # Model changed. Exact-name keys (_pae_plot_, _comp_plot_) are
+                # popped directly; the per-pair caches (interface zoom, interface
+                # contacts, per-pair viewer HTML and interface PAE) carry the
+                # model key as a prefix, so every key starting with it is dropped
+                # (prefix, not substring, so predictions whose names share a
+                # prefix do not cross-clear).
                 old_key = st.session_state.get('_detail_model_key', '')
                 old_pred = old_key.rsplit('_', 2)[0] if old_key else ''
                 to_drop = []
                 if old_key:
-                    to_drop.extend([
-                        f'_pae_plot_{old_key}',
-                        f'_zoom_plot_{old_key}',
-                        f'_iface_{old_key}',
-                    ])
+                    to_drop.append(f'_pae_plot_{old_key}')
                 if old_pred:
                     to_drop.append(f'_comp_plot_{old_pred}')
                 for k in to_drop:
                     st.session_state.pop(k, None)
+                if old_key:
+                    for _prefix in (f'_zoom_plot_{old_key}',
+                                    f'_iface_{old_key}',
+                                    f'_detail_pae_data_{old_key}',
+                                    f'_detail_viewer_html_{old_key}'):
+                        for k in list(st.session_state.keys()):
+                            if k.startswith(_prefix):
+                                st.session_state.pop(k, None)
 
                 # Recompute all derived data
-                confidences = load_confidences(pred_dir, selected_pred_name, seed, sample)
+                confidences = load_confidences(pred_dir, file_prefix, seed, sample)
                 pae_problem = None
                 if confidences is None and _is_af2:
                     from core.af2_pae import load_af2_confidences_checked
@@ -266,28 +277,34 @@ def show_detailed(project_path: str, af3_folder: str):
                 # or AlphaPulldown (AF2-multimer) PDB
                 sample_dir = pred_dir / f"seed-{seed}_sample-{sample}"
                 cif_candidates = [
-                    sample_dir / f"{selected_pred_name}_seed-{seed}_sample-{sample}_model.cif",
+                    sample_dir / f"{file_prefix}_seed-{seed}_sample-{sample}_model.cif",
                     sample_dir / "model.cif",
-                    pred_dir / f"{selected_pred_name}_model_{sample}.cif",  # AF3 Server flat
+                    pred_dir / f"{file_prefix}_model_{sample}.cif",  # AF3 Server flat
                     struct_dir / f"ranked_{sample}.pdb",                       # AlphaPulldown
-                    pred_dir / f"{selected_pred_name}_model.cif",
+                    pred_dir / f"{file_prefix}_model.cif",
                     pred_dir / "model.cif",
                 ]
                 cif_file = next((p for p in cif_candidates if p.exists()),
                                 cif_candidates[0])
 
-                # Chain labels. The scored pair (first two polymer chains) gets
-                # the bait / prey names when the folder name has the form
-                # <bait>_and_<prey>; ligand and ion chains get their residue
-                # name, e.g. "ATP (C)"; anything else "Chain X".
-                pair_ids = list(chain_ids_resolved[:2])
+                # Chain labels. When there are exactly two polymer chains they
+                # get the bait / prey names from the folder name if it has the
+                # form <bait>_and_<prey>; with more than two polymer chains the
+                # folder name no longer describes a single pair, so every
+                # polymer chain is labelled "Chain X". Ligand and ion chains
+                # get their residue name, e.g. "ATP (C)"; anything else "Chain X".
                 nonpolymer_ids = []
+                poly_ids = []
                 if chain_ids_resolved:
-                    from core.analyzer import interface_chain_pair, polymer_chain_ids
+                    from core.analyzer import polymer_chain_ids
                     if confidences is not None:
-                        pair_ids = [c for c in interface_chain_pair(confidences) if c]
-                        _polymers = set(polymer_chain_ids(confidences))
+                        poly_ids = list(polymer_chain_ids(confidences))
+                        _polymers = set(poly_ids)
                         nonpolymer_ids = [c for c in chain_ids_resolved if c not in _polymers]
+                    else:
+                        # AF2 without PAE/confidences: every parsed chain counts
+                        # (polymer vs. ligand cannot be told apart).
+                        poly_ids = list(chain_ids_resolved)
                     resnames = {}
                     if nonpolymer_ids and cif_file.exists():
                         try:
@@ -297,13 +314,13 @@ def show_detailed(project_path: str, af3_folder: str):
                                     resnames[_ch.name] = _ch[0].name
                         except Exception:
                             pass
-                    bait_acc, prey_acc = split_prediction_name(selected_pred_name)
                     pair_labels = {}
-                    if prey_acc and len(pair_ids) == 2:
+                    bait_acc, prey_acc = split_prediction_name(selected_pred_name)
+                    if prey_acc and len(poly_ids) == 2:
                         # gene_cache stores '' for unresolved accessions, so
                         # fall back to the name from the folder.
-                        pair_labels = {pair_ids[0]: gene_cache.get(bait_acc) or bait_acc,
-                                       pair_ids[1]: gene_cache.get(prey_acc) or prey_acc}
+                        pair_labels = {poly_ids[0]: gene_cache.get(bait_acc) or bait_acc,
+                                       poly_ids[1]: gene_cache.get(prey_acc) or prey_acc}
                     protein_names = []
                     for cid in chain_ids_resolved:
                         if cid in pair_labels:
@@ -313,11 +330,166 @@ def show_detailed(project_path: str, af3_folder: str):
                         else:
                             protein_names.append(f"Chain {cid}")
 
+                # Store everything in session state
+                st.session_state['_detail_model_key'] = model_key
+                st.session_state['_detail_confidences'] = confidences
+                st.session_state['_detail_chain_ids'] = chain_ids_resolved
+                st.session_state['_detail_pae_problem'] = pae_problem
+                st.session_state['_detail_chain_lengths'] = chain_lengths_resolved
+                st.session_state['_detail_protein_names'] = protein_names
+                st.session_state['_detail_nonpolymer_ids'] = nonpolymer_ids
+                st.session_state['_detail_polymer_ids'] = poly_ids
+                st.session_state['_detail_cif_file'] = str(cif_file)
+
+            # Retrieve from session state (instant — no recomputation)
+            confidences = st.session_state.get('_detail_confidences')
+            chain_ids_resolved = st.session_state.get('_detail_chain_ids', [])
+            chain_lengths_resolved = st.session_state.get('_detail_chain_lengths', [])
+            protein_names = st.session_state.get('_detail_protein_names', ['Chain A', 'Chain B'])
+            nonpolymer_ids = st.session_state.get('_detail_nonpolymer_ids', [])
+            cif_file = Path(st.session_state.get('_detail_cif_file', ''))
+            poly_ids = st.session_state.get('_detail_polymer_ids')
+            if poly_ids is None:
+                # Session left over from an older app version: recompute.
+                if confidences is not None:
+                    from core.analyzer import polymer_chain_ids
+                    poly_ids = list(polymer_chain_ids(confidences))
+                else:
+                    poly_ids = list(chain_ids_resolved)
+
+            # ── Chain pair selection ─────────────────────────────────────
+            # Load the per-model analysis record: it supplies the summary chain
+            # pair (default selection) plus per-pair ipSAE / pair iPTM values
+            # used for the option labels and the chain pair overview heatmaps.
+            # Prefer per-prediction JSON (fast), fall back to the big JSON.
+            @st.cache_data(ttl=300)
+            def _load_pred_analysis(pred_dir_str, pred_name):
+                """Load per-prediction af3_app_analysis.json (small, fast)."""
+                pred_json = Path(pred_dir_str) / "af3_app_analysis.json"
+                if pred_json.exists():
+                    with open(pred_json, 'r') as f:
+                        entries = json.load(f)
+                    return {(e['seed'], e['sample']): e for e in entries}
+                return None
+
+            @st.cache_data(ttl=300)
+            def _load_big_analysis_index(af3_dir):
+                """Fallback: load big JSON and index by prediction_name."""
+                cache_file = Path(af3_dir) / "af3_app_all_models_analysis.json"
+                index = {}
+                if cache_file.exists():
+                    with open(cache_file, 'r') as f:
+                        for entry in json.load(f):
+                            pn = entry['prediction_name']
+                            if pn not in index:
+                                index[pn] = {}
+                            index[pn][(entry['seed'], entry['sample'])] = entry
+                return index
+
+            cached_models = _load_pred_analysis(str(pred_dir), selected_pred_name)
+            if cached_models is None:
+                # Fall back to big JSON (cached after first load)
+                all_analysis = _load_big_analysis_index(af3_folder)
+                cached_models = all_analysis.get(selected_pred_name, {})
+
+            record = (cached_models or {}).get((seed, sample), {})
+
+            def _split_pair(chains):
+                """Parse an 'A:C' chain pair into its two chain ids."""
+                if isinstance(chains, (list, tuple)):
+                    return [str(c) for c in chains]
+                parts = str(chains or '').split(':')
+                return parts if len(parts) == 2 else []
+
+            # All unordered pairs of polymer chains, in chain order.
+            candidate_pairs = []
+            for _i in range(len(poly_ids)):
+                for _j in range(_i + 1, len(poly_ids)):
+                    candidate_pairs.append((poly_ids[_i], poly_ids[_j]))
+
+            # Per-pair record entries, keyed by unordered chain set.
+            _pairs_by_set = {}
+            for _p in (record.get('pairs') or []):
+                if not isinstance(_p, dict):
+                    continue
+                _ids = _split_pair(_p.get('chains'))
+                if len(_ids) == 2:
+                    _pairs_by_set[frozenset(_ids)] = _p
+
+            def _pair_label(pair):
+                """Option label, e.g. 'A:C  bait-prey  ipSAE 0.542  pair iPTM 0.64'."""
+                info = _pairs_by_set.get(frozenset(pair))
+                label = f"{pair[0]}:{pair[1]}"
+                if info:
+                    if info.get('role'):
+                        label += f"  {info['role']}"
+                    if info.get('ipsae') is not None:
+                        label += f"  ipSAE {info['ipsae']:.3f}"
+                    if info.get('pair_iptm') is not None:
+                        label += f"  pair iPTM {info['pair_iptm']:.2f}"
+                return label
+
+            # Default pair: the summary pair from the record, else the first
+            # pair in chain order.
+            default_pair = None
+            _cp_ids = _split_pair(record.get('chain_pair'))
+            if len(_cp_ids) == 2:
+                for _cand in candidate_pairs:
+                    if set(_cand) == set(_cp_ids):
+                        default_pair = list(_cand)
+                        break
+            if default_pair is None and candidate_pairs:
+                default_pair = list(candidate_pairs[0])
+            if default_pair is None:
+                default_pair = list(chain_ids_resolved[:2])
+
+            if len(candidate_pairs) > 1:
+                # More than two polymer chains: let the user pick which pair
+                # is analysed (defaults to the record's summary pair).
+                _select_key = f"_detail_pair_select_{model_key}"
+                _default_idx = 0
+                for _i, _cand in enumerate(candidate_pairs):
+                    if list(_cand) == default_pair:
+                        _default_idx = _i
+                        break
+                # Reset the widget when its last value is no longer a valid
+                # option (Streamlit would raise on an unknown value).
+                if _select_key in st.session_state and st.session_state[_select_key] not in candidate_pairs:
+                    del st.session_state[_select_key]
+                _chosen = st.selectbox(
+                    "Chain pair:",
+                    candidate_pairs,
+                    index=_default_idx,
+                    format_func=_pair_label,
+                    key=_select_key,
+                )
+                pair_ids = list(_chosen)
+            else:
+                pair_ids = default_pair
+
+            _name_of = dict(zip(chain_ids_resolved, protein_names))
+            pair_names = [_name_of.get(c, f"Chain {c}") for c in pair_ids]
+            pair_suffix = "_".join(pair_ids) if pair_ids else "none"
+
+            # ── Per-(model, pair) derived data ────────────────────────────
+            # The 3D viewer colours only the selected pair's interface once
+            # there is a choice, so viewer HTML and interface PAE are cached
+            # per (model, pair); everything above stays per model.
+            _pair_pae_key = f"_detail_pae_data_{model_key}_{pair_suffix}"
+            _pair_viewer_key = f"_detail_viewer_html_{model_key}_{pair_suffix}"
+            pae_data = st.session_state.get(_pair_pae_key)
+            viewer_html = st.session_state.get(_pair_viewer_key)
+            if _pair_viewer_key not in st.session_state:
                 # Compute interface PAE (uses confidences already in memory — no re-read)
                 pae_data = None
                 if confidences is not None and chain_ids_resolved and chain_lengths_resolved and cif_file.exists():
+                    # Always only the selected (protein) pair: with all chain
+                    # pairs, ions and ligands (e.g. Ca2+ in EF-hands) coloured
+                    # their binding residues as if they were an interface.
+                    only_pair = tuple(pair_ids) if len(pair_ids) == 2 else None
                     pae_data = compute_interface_pae_per_residue(
-                        cif_file, confidences, chain_ids_resolved, chain_lengths_resolved
+                        cif_file, confidences, chain_ids_resolved, chain_lengths_resolved,
+                        only_pair=only_pair
                     )
 
                 # Build 3D viewer HTML ONCE (the only expensive part)
@@ -343,30 +515,8 @@ def show_detailed(project_path: str, af3_folder: str):
                         model_format=model_format,
                         nonpolymer_chains=nonpolymer_ids,
                     )
-
-                # Store everything in session state
-                st.session_state['_detail_model_key'] = model_key
-                st.session_state['_detail_confidences'] = confidences
-                st.session_state['_detail_chain_ids'] = chain_ids_resolved
-                st.session_state['_detail_pair_ids'] = pair_ids
-                st.session_state['_detail_pae_problem'] = pae_problem
-                st.session_state['_detail_chain_lengths'] = chain_lengths_resolved
-                st.session_state['_detail_protein_names'] = protein_names
-                st.session_state['_detail_cif_file'] = str(cif_file)
-                st.session_state['_detail_pae_data'] = pae_data
-                st.session_state['_detail_viewer_html'] = viewer_html
-
-            # Retrieve from session state (instant — no recomputation)
-            confidences = st.session_state.get('_detail_confidences')
-            chain_ids_resolved = st.session_state.get('_detail_chain_ids', [])
-            pair_ids = st.session_state.get('_detail_pair_ids', chain_ids_resolved[:2])
-            chain_lengths_resolved = st.session_state.get('_detail_chain_lengths', [])
-            protein_names = st.session_state.get('_detail_protein_names', ['Chain A', 'Chain B'])
-            _name_of = dict(zip(chain_ids_resolved, protein_names))
-            pair_names = [_name_of.get(c, f"Chain {c}") for c in pair_ids]
-            cif_file = Path(st.session_state.get('_detail_cif_file', ''))
-            pae_data = st.session_state.get('_detail_pae_data')
-            viewer_html = st.session_state.get('_detail_viewer_html')
+                st.session_state[_pair_pae_key] = pae_data
+                st.session_state[_pair_viewer_key] = viewer_html
 
             # Tabs for different analysis views
             if st.session_state.get('_detail_pae_problem'):
@@ -391,6 +541,66 @@ def show_detailed(project_path: str, af3_folder: str):
             with tab1:
                 st.markdown("### PAE Matrix Visualization")
 
+                # Chain pairs: with more than two polymer chains every pair was
+                # scored per model; show ipSAE and pair iPTM as two chain x
+                # chain heatmaps for a quick overview.
+                _pairs_list = record.get('pairs') or []
+                if len(poly_ids) > 2 and any(
+                        isinstance(_p, dict) and _p.get('ipsae') is not None
+                        for _p in _pairs_list):
+                    st.subheader("Chain pairs")
+                    _entity_of = record.get('chain_entities') or {}
+                    _n = len(poly_ids)
+                    _mat_ipsae = np.full((_n, _n), np.nan)
+                    _mat_iptm = np.full((_n, _n), np.nan)
+                    for _p in _pairs_list:
+                        if not isinstance(_p, dict):
+                            continue
+                        _ids = _split_pair(_p.get('chains'))
+                        if len(_ids) != 2:
+                            continue
+                        try:
+                            _ia = poly_ids.index(_ids[0])
+                            _ib = poly_ids.index(_ids[1])
+                        except ValueError:
+                            continue
+                        if _p.get('ipsae') is not None:
+                            _mat_ipsae[_ia, _ib] = _p['ipsae']
+                            _mat_ipsae[_ib, _ia] = _p['ipsae']
+                        if _p.get('pair_iptm') is not None:
+                            _mat_iptm[_ia, _ib] = _p['pair_iptm']
+                            _mat_iptm[_ib, _ia] = _p['pair_iptm']
+
+                    def _axis_label(cid):
+                        # Chain ID plus molecule ID from the record, e.g. 'A (1)'.
+                        _ent = _entity_of.get(cid)
+                        if _ent in (None, ''):
+                            return cid
+                        return f"{cid} ({_ent})"
+
+                    _fig, (_ax_ipsae, _ax_iptm) = plt.subplots(
+                        1, 2, figsize=(8.0, max(3.5, 0.45 * _n + 2.5)))
+                    for _ax, _mat, _title in (
+                            (_ax_ipsae, _mat_ipsae, 'ipSAE'),
+                            (_ax_iptm, _mat_iptm, 'pair iPTM')):
+                        _ax.imshow(_mat, cmap='Greens', vmin=0, vmax=1)
+                        _ax.set_xticks(range(_n))
+                        _ax.set_yticks(range(_n))
+                        _ax.set_xticklabels([_axis_label(c) for c in poly_ids],
+                                            rotation=90, fontsize=7)
+                        _ax.set_yticklabels([_axis_label(c) for c in poly_ids],
+                                            fontsize=7)
+                        _ax.set_title(_title, fontsize=9)
+                        for _i in range(_n):
+                            for _j in range(_n):
+                                _v = _mat[_i, _j]
+                                if not np.isnan(_v):
+                                    _ax.text(_j, _i, f"{_v:.2f}",
+                                             ha='center', va='center', fontsize=6)
+                    _fig.tight_layout()
+                    st.pyplot(_fig)
+                    plt.close(_fig)
+
                 if confidences is None and _is_af2:
                     st.info(
                         "**No PAE matrix for this AF2-multimer prediction.** "
@@ -409,7 +619,6 @@ def show_detailed(project_path: str, af3_folder: str):
                                 pae_matrix, protein_names, chain_lengths_resolved,
                                 title=f'{selected_pred_name} (seed-{seed}_sample-{sample})'
                             )
-                            import io
                             buf = io.BytesIO()
                             fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
                             plt.close(fig)
@@ -425,7 +634,7 @@ def show_detailed(project_path: str, af3_folder: str):
                             chain_a_idx = chain_indices[pair_ids[0]]
                             chain_b_idx = chain_indices[pair_ids[1]]
 
-                            zoom_plot_key = f"_zoom_plot_{model_key}"
+                            zoom_plot_key = f"_zoom_plot_{model_key}_{pair_suffix}"
                             if zoom_plot_key not in st.session_state:
                                 fig_zoom = plot_pae_interface_zoom(
                                     pae_matrix, chain_a_idx, chain_b_idx,
@@ -461,15 +670,17 @@ def show_detailed(project_path: str, af3_folder: str):
                     )
 
                 if _can_full or _can_spatial:
-                    iface_key = f"_iface_{model_key}"
+                    iface_key = f"_iface_{model_key}_{pair_suffix}"
                     if iface_key not in st.session_state:
                         if _can_full:
                             st.session_state[iface_key] = analyze_interface(
-                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
+                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0,
+                                chain_pair=tuple(pair_ids)
                             )
                         else:
                             st.session_state[iface_key] = analyze_interface_spatial(
-                                cif_file, distance_cutoff=8.0
+                                cif_file, distance_cutoff=8.0,
+                                chain_pair=tuple(pair_ids)
                             )
                     interface_result = st.session_state[iface_key]
 
@@ -556,10 +767,15 @@ def show_detailed(project_path: str, af3_folder: str):
                             else:
                                 st.write("No hub residues found")
 
-                        # Interface region mapping
-                        if len(chain_lengths_resolved) >= 2:
+                        # Interface region mapping. Lengths of the two chosen
+                        # chains, looked up by their index in chain_ids_resolved
+                        # (the pair is no longer the first two chains).
+                        _chain_len_by_id = dict(zip(chain_ids_resolved, chain_lengths_resolved))
+                        _len_a = _chain_len_by_id.get(pair_ids[0]) if pair_ids else None
+                        _len_b = _chain_len_by_id.get(pair_ids[1]) if len(pair_ids) > 1 else None
+                        if _len_a is not None and _len_b is not None:
                             st.subheader("Interface Sequence Regions")
-                            region_info = map_interface_regions(contacts, chain_lengths_resolved[0], chain_lengths_resolved[1])
+                            region_info = map_interface_regions(contacts, _len_a, _len_b)
 
                             col1, col2 = st.columns(2)
                             with col1:
@@ -587,37 +803,8 @@ def show_detailed(project_path: str, af3_folder: str):
                 from core.analyzer import load_summary
                 from core.pae_plotter import plot_all_models_comparison
 
-                # Load analysis results: prefer per-prediction JSON (fast), fall back to big JSON
-                @st.cache_data(ttl=300)
-                def _load_pred_analysis(pred_dir_str, pred_name):
-                    """Load per-prediction af3_app_analysis.json (small, fast)."""
-                    pred_json = Path(pred_dir_str) / "af3_app_analysis.json"
-                    if pred_json.exists():
-                        with open(pred_json, 'r') as f:
-                            entries = json.load(f)
-                        return {(e['seed'], e['sample']): e for e in entries}
-                    return None
-
-                @st.cache_data(ttl=300)
-                def _load_big_analysis_index(af3_dir):
-                    """Fallback: load big JSON and index by prediction_name."""
-                    cache_file = Path(af3_dir) / "af3_app_all_models_analysis.json"
-                    index = {}
-                    if cache_file.exists():
-                        with open(cache_file, 'r') as f:
-                            for entry in json.load(f):
-                                pn = entry['prediction_name']
-                                if pn not in index:
-                                    index[pn] = {}
-                                index[pn][(entry['seed'], entry['sample'])] = entry
-                    return index
-
-                # Try per-prediction file first (tiny, instant)
-                cached_models = _load_pred_analysis(str(pred_dir), selected_pred_name)
-                if cached_models is None:
-                    # Fall back to big JSON (cached after first load)
-                    all_analysis = _load_big_analysis_index(af3_folder)
-                    cached_models = all_analysis.get(selected_pred_name, {})
+                # cached_models (and the selected model's record) were loaded
+                # above the tabs for the chain pair selector; reuse them here.
 
                 # Compare all 5 models in a table with per-model metrics
                 comparison_data = []
@@ -632,7 +819,7 @@ def show_detailed(project_path: str, af3_folder: str):
                         model_iptm = ss['iptm']
                         model_ptm = ss.get('ptm', model_iptm)
                     else:
-                        model_summary = load_summary(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
+                        model_summary = load_summary(pred_dir, file_prefix, ss['seed'], ss['sample'])
                         model_iptm = model_summary.get('iptm', 0) if model_summary else selected_pred['iptm']
                         model_ptm = model_summary.get('ptm', 0) if model_summary else selected_pred['ptm']
 
@@ -665,13 +852,12 @@ def show_detailed(project_path: str, af3_folder: str):
                     for ss in seed_samples:
                         is_top = ss['seed'] == top_seed and ss['sample'] == top_sample
                         label = "Top" if is_top else f"s{ss['seed']}-m{ss['sample']}"
-                        conf = load_confidences(pred_dir, selected_pred_name, ss['seed'], ss['sample'])
+                        conf = load_confidences(pred_dir, file_prefix, ss['seed'], ss['sample'])
                         if conf and conf.get('pae'):
                             pae_matrices.append(np.array(conf['pae']))
                             model_labels.append(label)
 
                     if pae_matrices:
-                        import io
                         fig = plot_all_models_comparison(pae_matrices, model_labels, chain_lengths_resolved, protein_names)
                         buf = io.BytesIO()
                         fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
@@ -697,17 +883,19 @@ def show_detailed(project_path: str, af3_folder: str):
                     pae_data_pymol = pae_data
 
                     # Reuse interface analysis from tab2 (compute spatially if AP)
-                    iface_key = f"_iface_{model_key}"
+                    iface_key = f"_iface_{model_key}_{pair_suffix}"
                     if iface_key not in st.session_state:
                         if confidences is not None:
                             from core.interface_analyzer import analyze_interface as _analyze_iface
                             st.session_state[iface_key] = _analyze_iface(
-                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0
+                                cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0,
+                                chain_pair=tuple(pair_ids)
                             )
                         else:
                             from core.interface_analyzer import analyze_interface_spatial as _analyze_iface_spatial
                             st.session_state[iface_key] = _analyze_iface_spatial(
-                                cif_file, distance_cutoff=8.0
+                                cif_file, distance_cutoff=8.0,
+                                chain_pair=tuple(pair_ids)
                             )
                     iface_result = st.session_state[iface_key]
                     contacts_pymol = iface_result.get('contacts', []) if iface_result else None
@@ -760,7 +948,6 @@ def show_detailed(project_path: str, af3_folder: str):
                 st.markdown("### Export Options")
 
                 import numpy as np
-                import io
 
                 if confidences is not None:
                     pae_matrix = np.array(confidences.get('pae', []))
@@ -779,15 +966,20 @@ def show_detailed(project_path: str, af3_folder: str):
                     st.caption("PAE matrix export needs ranked_N_PAE.csv files for AF2-multimer predictions.")
 
                 if cif_file.exists():
-                    iface_key = f"_iface_{model_key}"
+                    iface_key = f"_iface_{model_key}_{pair_suffix}"
                     if iface_key in st.session_state and st.session_state[iface_key]:
                         contacts = st.session_state[iface_key].get('contacts', [])
                     elif confidences is not None:
-                        from core.analyzer import calculate_interface_contacts
-                        contacts = calculate_interface_contacts(cif_file, confidences)
+                        from core.interface_analyzer import analyze_interface as _analyze_iface_export
+                        contacts = _analyze_iface_export(
+                            cif_file, confidences, pae_cutoff=10.0, distance_cutoff=8.0,
+                            chain_pair=tuple(pair_ids)
+                        ).get('contacts', [])
                     else:
                         from core.interface_analyzer import analyze_interface_spatial
-                        contacts = analyze_interface_spatial(cif_file).get('contacts', [])
+                        contacts = analyze_interface_spatial(
+                            cif_file, distance_cutoff=8.0, chain_pair=tuple(pair_ids)
+                        ).get('contacts', [])
 
                     if contacts:
                         import pandas as pd

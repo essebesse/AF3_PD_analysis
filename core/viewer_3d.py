@@ -44,6 +44,7 @@ def compute_interface_pae_per_residue(
     chain_lengths: List[int],
     pae_cutoff: float = 12.0,
     distance_cutoff: float = 8.0,
+    only_pair: Optional[Tuple[str, str]] = None,
 ) -> Dict[str, List[Tuple[int, float]]]:
     """
     Identify interface residues using both inter-chain PAE and spatial proximity.
@@ -54,7 +55,8 @@ def compute_interface_pae_per_residue(
     3. Color residues that pass both filters
 
     Returns dict mapping chain_id -> [(residue_number, best_pae), ...]
-    Only interface residues are included.
+    Only interface residues are included. With ``only_pair`` (two chain IDs)
+    only that chain pair's interface is computed; default all chain pairs.
     """
     pae_matrix = np.array(confidences.get('pae', []))
     if pae_matrix.size == 0 or len(chain_ids) < 2:
@@ -69,6 +71,8 @@ def compute_interface_pae_per_residue(
     candidates = []
     for i in range(len(chain_ids)):
         for j in range(i + 1, len(chain_ids)):
+            if only_pair and {chain_ids[i], chain_ids[j]} != set(only_pair):
+                continue
             si, ei = boundaries[i], boundaries[i + 1]
             sj, ej = boundaries[j], boundaries[j + 1]
 
@@ -219,6 +223,10 @@ def generate_viewer_html(
     n_interface = 0
     if has_pae:
         for chain_id, residue_paes in pae_residue_data.items():
+            if chain_id in ligands:
+                # A cartoon style would replace the ligand's sticks/spheres
+                # and hide single-atom ions.
+                continue
             for res_num, pae_val in residue_paes:
                 color = _pae_to_hex(pae_val)
                 style_lines.append(

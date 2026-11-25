@@ -13,25 +13,115 @@ from typing import Dict, List, Optional, Tuple
 import re
 
 
+def _has_af3_output(d: Path) -> bool:
+    """d holds AF3 local-pipeline output: a ranking_scores.csv or
+    summary_confidences.json (with or without the job-name prefix) or
+    seed-N_sample-M/ folders."""
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                n = e.name
+                if n.endswith('ranking_scores.csv') or n.endswith('summary_confidences.json'):
+                    if e.is_file():
+                        return True
+                elif n.startswith('seed-') and '_sample-' in n and e.is_dir():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def prediction_kind(d: Path) -> Optional[str]:
+    """Format of the prediction output held directly in d ('server_flat',
+    'af2', 'alphapulldown' or 'af3'), or None when d holds none. AF2 counts
+    when its files are in d or in d/seq/."""
+    if _is_af3_server_flat(d):
+        return 'server_flat'
+    wd = _af2_work_dir(d)
+    if wd is not None:
+        return _af2_format(wd)
+    if _has_af3_output(d):
+        return 'af3'
+    return None
+
+
+def _subdirs(d: Path) -> List[Path]:
+    """Sub-folders worth searching: not hidden, not AF3 seed-N_sample-M/."""
+    try:
+        with os.scandir(d) as it:
+            return sorted(Path(e.path) for e in it
+                          if e.is_dir() and not e.name.startswith(('.', 'seed-', '__pycache__')))
+    except OSError:
+        return []
+
+
+def find_prediction_dirs(root: Path, max_depth: int = 4) -> List[Tuple[Path, str]]:
+    """Every prediction folder at or below root, at most max_depth levels down,
+    as (folder, format). The search does not go below a prediction folder,
+    so a normal pulldown costs one listing per prediction."""
+    found: List[Tuple[Path, str]] = []
+
+    def walk(d: Path, depth: int):
+        kind = prediction_kind(d)
+        if kind:
+            found.append((d, kind))
+            return
+        if depth < max_depth:
+            for sub in _subdirs(d):
+                walk(sub, depth + 1)
+
+    walk(Path(root), 0)
+    return found
+
+
 def resolve_prediction_dir(d: Path) -> Path:
     """
-    Resolve extra nesting from AF3 Server / Universal jobs.
+    The folder below d that holds the output of the prediction named d.name.
 
-    AF3 Server sometimes creates: AF3/name/name/ where the inner folder
-    holds the actual data (seed dirs, ranking_scores.csv, etc.).
-    This detects that pattern and returns the inner directory.
+    d itself when it holds prediction output. Otherwise a folder with the same
+    name up to 3 levels down, searched only through small folders (at most 5
+    sub-folders), so a run folder with extra nesting is resolved:
+      name/name/            (AF3 Server / Universal jobs)
+      name/AF3/name/        (run folders with msa/ beside the AF3 output)
+      name/output/run1/name/
+    Requiring the same name keeps a folder of separate projects from being
+    taken for one prediction.
     """
-    inner = d / d.name
-    if inner.is_dir():
-        # Check if the inner dir has AF3 data files (seed dirs or ranking_scores)
-        has_seeds = any(
-            c.is_dir() and c.name.startswith('seed-') for c in inner.iterdir()
-        )
-        has_ranking = (inner / f"{d.name}_ranking_scores.csv").exists() or (inner / "ranking_scores.csv").exists()
-        has_summary = (inner / f"{d.name}_summary_confidences.json").exists() or (inner / "summary_confidences.json").exists()
-        if has_seeds or has_ranking or has_summary:
-            return inner
-    return d
+    d = Path(d)
+    if prediction_kind(d):
+        return d
+
+    def walk(cur: Path, depth: int) -> Optional[Path]:
+        subs = _subdirs(cur)
+        if len(subs) > 5:
+            return None
+        for sub in subs:
+            if sub.name == d.name and prediction_kind(sub):
+                return sub
+        if depth < 3:
+            for sub in subs:
+                hit = walk(sub, depth + 1)
+                if hit is not None:
+                    return hit
+        return None
+
+    return walk(d, 1) or d
+
+
+def prediction_file_prefix(pred_dir: Path) -> str:
+    """Job-name prefix of the AF3 files in pred_dir (<prefix>_ranking_scores.csv,
+    <prefix>_summary_confidences.json, <prefix>_summary_confidences_0.json).
+    Usually the folder name; differs when the folder was renamed."""
+    pred_dir = Path(pred_dir)
+    name = pred_dir.name
+    suffixes = ('_ranking_scores.csv', '_summary_confidences.json', '_summary_confidences_0.json')
+    if any((pred_dir / f"{name}{suf}").exists() for suf in suffixes):
+        return name
+    for suf in suffixes:
+        hits = sorted(pred_dir.glob(f"*{suf}"))
+        if hits:
+            return hits[0].name[:-len(suf)]
+    return name
 
 
 def af3_models_on_disk(pred_dir: Path, seed_samples: List[Dict]) -> List[Dict]:
@@ -49,7 +139,7 @@ def af3_models_on_disk(pred_dir: Path, seed_samples: List[Dict]) -> List[Dict]:
         names = set(os.listdir(pred_dir))
     except OSError:
         return seed_samples
-    prefix = pred_dir.name
+    prefix = prediction_file_prefix(pred_dir)
     top = max(seed_samples, key=lambda ss: float(ss['ranking_score']))
     kept = []
     for ss in seed_samples:
@@ -80,7 +170,7 @@ def _is_af3_server_flat(d: Path) -> bool:
             for f in files
         )
         return has_model and has_summary
-    except PermissionError:
+    except OSError:   # missing folder, not a folder, no permission
         return False
 
 
@@ -127,32 +217,15 @@ def _af2_entry(d: Path, work_dir: Path) -> Dict:
 
 def _dir_has_predictions(d: Path) -> bool:
     """
-    Check if a directory directly contains prediction data — either AF3
-    flat server files in d itself, or AF3/AlphaPulldown prediction
-    subdirectories inside d.
+    Check if a directory directly contains prediction data: AF3 Server flat
+    files in d itself, or a sub-folder that holds prediction output (also
+    behind same-name nesting, see resolve_prediction_dir).
     """
-    # Flat server format: the files are directly inside d (no subdirs needed)
     if _is_af3_server_flat(d):
         return True
-    try:
-        for child in d.iterdir():
-            if not child.is_dir() or child.name.startswith('.'):
-                continue
-            resolved = resolve_prediction_dir(child)
-            # AF3 Server flat format in a child dir
-            if _is_af3_server_flat(resolved):
-                return True
-            # AlphaPulldown (AF2-multimer)
-            if _is_alphapulldown_format(resolved):
-                return True
-            # Local pipeline: summary_confidences.json present
-            if any(resolved.glob('*summary_confidences.json')):
-                return True
-            # Local pipeline: seed subdirectories
-            if any(c.is_dir() and c.name.startswith('seed-') for c in resolved.iterdir()):
-                return True
-    except PermissionError:
-        pass
+    for child in _subdirs(d):
+        if prediction_kind(resolve_prediction_dir(child)):
+            return True
     return False
 
 
@@ -191,6 +264,15 @@ def find_af3_projects_recursive(root: str, max_depth: int = 6) -> List[Dict]:
             'af3_folder': str(root_path),
             'label': root_path.name,
             'format': _af2_format(root_wd),
+        }]
+
+    # Root itself holds prediction folders (user browsed into a pulldown):
+    # offer root, not every prediction as its own project
+    if _dir_has_predictions(root_path):
+        return [{
+            'project_path': str(root_path),
+            'af3_folder': str(root_path),
+            'label': root_path.name,
         }]
 
     def _walk(current: Path, depth: int):
@@ -438,8 +520,10 @@ def load_prediction_data(pred_dir: Path) -> Optional[Dict]:
         if af2_wd is not None:
             return _load_alphapulldown_prediction(pred_dir, af2_wd)
 
-        # Find summary_confidences.json
-        summary_file = pred_dir / f"{pred_name}_summary_confidences.json"
+        # Find summary_confidences.json (file prefix differs from the
+        # folder name when the folder was renamed)
+        prefix = prediction_file_prefix(pred_dir)
+        summary_file = pred_dir / f"{prefix}_summary_confidences.json"
         if not summary_file.exists():
             summary_file = pred_dir / "summary_confidences.json"
         if not summary_file.exists():
@@ -456,7 +540,7 @@ def load_prediction_data(pred_dir: Path) -> Optional[Dict]:
         with open(summary_file, 'r') as f:
             summary = json.load(f)
 
-        ranking_file = pred_dir / f"{pred_name}_ranking_scores.csv"
+        ranking_file = pred_dir / f"{prefix}_ranking_scores.csv"
         if not ranking_file.exists():
             ranking_file = pred_dir / "ranking_scores.csv"
         seed_samples = []
@@ -491,96 +575,57 @@ def load_prediction_data(pred_dir: Path) -> Optional[Dict]:
         return None
 
 
+def _scan_entry(d: Path, kind: str) -> Dict:
+    """Scan entry for prediction folder d of format kind."""
+    if kind in ('af2', 'alphapulldown'):
+        return _af2_entry(d, _af2_work_dir(d))
+    name = d.name
+    name_part = name[5:] if kind == 'server_flat' and name.startswith('fold_') else name
+    m = re.match(r'(.+)_and_(.+)', name_part)
+    bait, prey = (m.group(1), m.group(2)) if m else (name_part, "")
+    return {'name': name, 'bait': bait, 'prey': prey,
+            'prediction_dir': str(d), 'format': kind}
+
+
 class AF3Scanner:
     """Fast scanner: lists directories instantly, loads data on demand."""
 
     def __init__(self, predictions_folder: Path):
         self.af3_folder = Path(predictions_folder)
         self.predictions = []
+        self.skipped = []
+        self.duplicates = []
 
     def scan(self) -> List[Dict]:
         """
-        Fast scan: lists subdirectories (and detects AF3 Server flat format).
-        Returns list of dicts with name, bait, prey, prediction_dir.
+        Find every prediction folder at or below the predictions folder (up to
+        4 levels down; the folder itself may be one prediction). Returns dicts
+        with name, bait, prey, prediction_dir, format. Folders directly below
+        the predictions folder that hold no prediction output (logs, MSAs,
+        unfinished runs) are listed in self.skipped.
         """
         if not self.af3_folder.exists():
             raise ValueError(f"Predictions folder not found: {self.af3_folder}")
 
         self.predictions = []
+        self.skipped = []
+        found = find_prediction_dirs(self.af3_folder)
+        for d, kind in found:
+            self.predictions.append(_scan_entry(d, kind))
 
-        # If the folder itself is an AF3 Server flat prediction (user pointed
-        # directly at the unzipped server folder), treat it as one prediction.
-        if _is_af3_server_flat(self.af3_folder):
-            pred_name = self.af3_folder.name
-            name_part = pred_name[5:] if pred_name.startswith('fold_') else pred_name
-            and_match = re.match(r'(.+)_and_(.+)', name_part)
-            if and_match:
-                bait_name, prey_name = and_match.group(1), and_match.group(2)
+        # Results are keyed by prediction name, so two folders with the same
+        # name (e.g. v1/pairA/ and v2/pairA/) would be mixed up: report them.
+        seen: Dict[str, str] = {}
+        self.duplicates = []
+        for p in self.predictions:
+            if p['name'] in seen:
+                self.duplicates.append((seen[p['name']], p['prediction_dir']))
             else:
-                bait_name, prey_name = name_part, ""
-            self.predictions.append({
-                'name': pred_name,
-                'bait': bait_name,
-                'prey': prey_name,
-                'prediction_dir': str(self.af3_folder),
-                'format': 'server_flat',
-            })
-            return self.predictions
+                seen[p['name']] = p['prediction_dir']
 
-        # The folder itself is one AF2 prediction (ranked_*.pdb here or in seq/)
-        own_wd = _af2_work_dir(self.af3_folder)
-        if own_wd is not None:
-            self.predictions.append(_af2_entry(self.af3_folder, own_wd))
-            return self.predictions
-
-        for d in sorted(self.af3_folder.iterdir()):
-            if not d.is_dir() or d.name.startswith('seed-') or d.name.startswith('.'):
-                continue
-
-            # Resolve AF3 Server extra nesting (name/name/)
-            resolved = resolve_prediction_dir(d)
-
-            # AF3 Server flat prediction folder inside the scanned directory
-            if _is_af3_server_flat(resolved):
-                pred_name = resolved.name
-                name_part = pred_name[5:] if pred_name.startswith('fold_') else pred_name
-                and_match = re.match(r'(.+)_and_(.+)', name_part)
-                if and_match:
-                    bait_name, prey_name = and_match.group(1), and_match.group(2)
-                else:
-                    bait_name, prey_name = name_part, ""
-                self.predictions.append({
-                    'name': pred_name,
-                    'bait': bait_name,
-                    'prey': prey_name,
-                    'prediction_dir': str(resolved),
-                    'format': 'server_flat',
-                })
-                continue
-
-            # AF2-multimer (AlphaPulldown, or AF2 with PAE CSVs)
-            child_wd = _af2_work_dir(resolved)
-            if child_wd is not None:
-                self.predictions.append(_af2_entry(resolved, child_wd))
-                continue
-
-            pred_name = resolved.name
-            match = re.match(r'(.+)_and_(.+)', pred_name)
-            if match:
-                bait_name = match.group(1)
-                prey_name = match.group(2)
-            else:
-                bait_name = pred_name
-                prey_name = ""
-
-            self.predictions.append({
-                'name': pred_name,
-                'bait': bait_name,
-                'prey': prey_name,
-                'prediction_dir': str(resolved),
-                'format': 'af3',
-            })
-
+        if not (found and found[0][0] == self.af3_folder):
+            covered = {d.relative_to(self.af3_folder).parts[0] for d, _ in found}
+            self.skipped = [c.name for c in _subdirs(self.af3_folder) if c.name not in covered]
         return self.predictions
 
     def load_all(self) -> List[Dict]:

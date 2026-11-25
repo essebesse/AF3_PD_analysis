@@ -39,14 +39,15 @@ def _no_models_hint(input_dir: Path) -> None:
 
 
 def analyze_single_prediction(pred_dir: Path, pae_cutoff: float = 10.0,
-                               all_models: bool = False) -> list:
+                               all_models: bool = False, bait_chains: str = None) -> list:
     """
     Analyze a single prediction directory.
     Default: top-ranked model only. --all_models: all 5 seed/sample models.
     """
     from core.analyzer import analyze_prediction_all_models
     return analyze_prediction_all_models(
-        pred_dir, ipsae_pae_cutoff=pae_cutoff, top_only=(not all_models)
+        pred_dir, ipsae_pae_cutoff=pae_cutoff, top_only=(not all_models),
+        bait_override=bait_chains,
     )
 
 
@@ -62,6 +63,10 @@ def main():
                         help='PAE cutoff for ipSAE calculation (default: 10.0)')
     parser.add_argument('--all_models', action='store_true',
                         help='Analyze all 5 models per prediction (default: top-ranked only)')
+    parser.add_argument('--bait_chains', type=str, default=None,
+                        help='Bait chain IDs for complexes with more than two chains, e.g. "A,B" '
+                             '(default: chain A and its copies; with "_with_" in the folder name '
+                             'every chain but the last protein)')
     parser.add_argument('--output_file', type=str, default=None,
                         help='Output JSON file (default: af3_app_all_models_analysis.json in input_dir)')
 
@@ -108,7 +113,8 @@ def main():
     from functools import partial
     analyze_fn = partial(analyze_single_prediction,
                          pae_cutoff=args.pae_cutoff,
-                         all_models=args.all_models)
+                         all_models=args.all_models,
+                         bait_chains=args.bait_chains)
 
     with Pool(actual_cpus) as pool:
         for i, result_list in enumerate(pool.imap_unordered(
@@ -127,7 +133,8 @@ def main():
                 # Use resolve_prediction_dir to handle AF3 Server nesting (name/name/)
                 pred_name = result_list[0].get('prediction_name', '')
                 if pred_name:
-                    target_dir = dir_by_name.get(pred_name)
+                    target_dir = (Path(result_list[0]['prediction_dir'])
+                                  if result_list[0].get('prediction_dir') else dir_by_name.get(pred_name))
                     if target_dir is None:
                         continue
                     pred_json = target_dir / "af3_app_analysis.json"

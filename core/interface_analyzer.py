@@ -7,13 +7,14 @@ Based on spatial_interface_analysis.py and interface_analysis.py but generalized
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from core.analyzer import CIFParser, extract_chain_indices, _structure_pair
+from core.analyzer import CIFParser, chain_token_indices, _structure_pair
 
 
 def analyze_interface(cif_path: Path,
                       confidences: dict,
                       pae_cutoff: float = 10.0,
-                      distance_cutoff: float = 8.0) -> dict:
+                      distance_cutoff: float = 8.0,
+                      chain_pair: Optional[Tuple[str, str]] = None) -> dict:
     """
     Full interface analysis combining PAE and spatial filtering.
 
@@ -22,6 +23,8 @@ def analyze_interface(cif_path: Path,
         confidences: Dictionary loaded from confidences.json
         pae_cutoff: PAE cutoff for interface definition
         distance_cutoff: Cbeta-Cbeta distance cutoff
+        chain_pair: (chain A, chain B) to analyse; default the first two
+            polymer chains (interface_chain_pair)
 
     Returns dict with:
         'contacts': list of contact dicts
@@ -64,7 +67,13 @@ def analyze_interface(cif_path: Path,
             'summary': {}
         }
 
-    _, chain_a_indices, chain_b_indices, _ = extract_chain_indices(confidences)
+    if chain_pair and all(c in chain_ids for c in chain_pair):
+        chain_a_id, chain_b_id = chain_pair
+    else:
+        chain_a_id, chain_b_id = _structure_pair(chain_ids, confidences)
+    tok = chain_token_indices(confidences)
+    chain_a_indices = tok.get(chain_a_id, [])
+    chain_b_indices = tok.get(chain_b_id, [])
     if not chain_a_indices or not chain_b_indices:
         return {
             'contacts': [],
@@ -73,7 +82,6 @@ def analyze_interface(cif_path: Path,
             'summary': {}
         }
 
-    chain_a_id, chain_b_id = _structure_pair(chain_ids, confidences)
     chain_a_residues = parser.get_chain_residues(chain_a_id)
     chain_b_residues = parser.get_chain_residues(chain_b_id)
 
@@ -173,7 +181,8 @@ def analyze_interface(cif_path: Path,
 
 
 def analyze_interface_spatial(cif_path: Path,
-                               distance_cutoff: float = 8.0) -> dict:
+                               distance_cutoff: float = 8.0,
+                               chain_pair: Optional[Tuple[str, str]] = None) -> dict:
     """Spatial-only interface analysis (no PAE filter).
 
     Used for AlphaPulldown / AF2-multimer output where the per-residue PAE
@@ -194,7 +203,10 @@ def analyze_interface_spatial(cif_path: Path,
         return {'contacts': [], 'hub_residues_a': [], 'hub_residues_b': [],
                 'summary': {}}
 
-    chain_a_id, chain_b_id = chain_ids[0], chain_ids[1]
+    if chain_pair and all(c in chain_ids for c in chain_pair):
+        chain_a_id, chain_b_id = chain_pair
+    else:
+        chain_a_id, chain_b_id = chain_ids[0], chain_ids[1]
     chain_a_residues = parser.get_chain_residues(chain_a_id)
     chain_b_residues = parser.get_chain_residues(chain_b_id)
 

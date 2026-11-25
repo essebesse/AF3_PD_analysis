@@ -59,10 +59,18 @@ sudo apt install python3-venv     # skip on macOS and on clusters where it's alr
 # Create and activate the virtual environment
 python3 -m venv .venv
 source .venv/bin/activate         # Linux / macOS
+# Windows (PowerShell): py -m venv .venv   then   .venv\Scripts\Activate.ps1
 
 # Install dependencies
 pip install -r requirements.txt
 ```
+
+### Starting the app
+
+Linux / macOS: `./run.sh`. Windows (`run.sh` is a bash script): activate the
+environment as above, then `streamlit run app.py`. The browser opens at
+`http://localhost:8501`. The SLURM tab only appears where `sbatch` exists, so
+on a laptop analyses run on the local CPU cores.
 
 ### Option 2: conda (no sudo, useful on shared clusters)
 
@@ -153,6 +161,15 @@ of the code.
 
 The scanner auto-detects three formats per folder. You can mix subfolders of
 different formats under one project; each gets handled appropriately.
+
+Prediction folders are recognised by the files they contain, anywhere up to
+four levels below the selected folder, so the layouts below are examples, not
+requirements. Also found: run folders with the AF3 output further down
+(`<name>/AF3/<name>/` next to an `msa/` folder), predictions split into
+sub-folders (`batch1/`, `batch2/`), folders renamed after the run, and a single
+prediction folder selected on its own. Folders without prediction output
+(unfinished runs, logs, MSAs) are skipped and listed on the Load Data page.
+Prediction names must be unique below the selected folder.
 
 ### Local AF3 pipeline output
 
@@ -274,7 +291,10 @@ af3_analysis_app/
 
 ## Analysis Metrics
 
-- **Which chains**: every metric is computed for one pair of chains per model, the first two polymer chains (protein, DNA, RNA). Ligand and ion chains are skipped, whatever their position in the input (in AF3 a ligand has one token per atom on a single residue number, an ion a single token). With fewer than two polymer chains (e.g. one protein plus a lipid), the first two chains of any kind are used. Other chain pairs in larger complexes are not scored.
+- **Which chains**: every pair of polymer chains (protein, DNA, RNA) is scored in every model. Ligand and ion chains are skipped, whatever their position in the input (in AF3 a ligand has one token per atom on a single residue number, an ion a single token). With fewer than two polymer chains (e.g. one protein plus a lipid), all chains are used.
+- **Bait and prey chains**: copies of one protein are chains with identical sequences. By default the bait is the first polymer chain and its copies, every other chain is prey. With `_with_` in the folder name (AlphaPulldown convention `bait1_bait2_with_prey`), the last protein and its copies are prey and all other chains are bait. The bait chains can be set per folder on the Analyze page (e.g. `A,B`; CLI `--bait_chains A,B`); the choice is stored with the results. Each chain pair is labelled bait-prey, bait-bait or prey-prey.
+- **Summary pair**: the row per model (Results, summary file, exports) shows the bait-prey pair with the highest ipSAE; for a complex without a bait-prey pair (e.g. a homodimer) the pair with the highest ipSAE. For two-chain predictions this is the only pair. On the Results page, "One row per chain pair" lists every pair; the XLSX export has a second sheet "Chain pairs". Detailed Analysis has a chain-pair selector and chain × chain ipSAE and pair iPTM maps.
+- **Pair iPTM**: AF3's `chain_pair_iptm` for the scored pair (AF3 and AlphaFold Server only). The iPTM column is for the whole complex.
 - **iPTM**: Interface predicted template modeling score. For AF2-multimer the displayed value is the combined ranking confidence (0.8·iPTM + 0.2·pTM) from `ranking_debug.json`, since that file doesn't store the two separately.
 - **ipSAE**: Interface predicted structure alignment error score (Dunbrack 2025), PAE cutoff 10 Å by default, the larger of the two directions (A→B, B→A). AF3, and AF2 with PAE CSVs.
 - **iPLDDT**: Mean per-atom pLDDT over residues in contacts with PAE ≤ 6 Å. From AF3 `atom_plddts`, or from the PDB B-factor column for AF2 (hydrogens excluded).
@@ -294,9 +314,10 @@ af3_analysis_app/
 
 ## Validation
 
-`validation/ipsae_vs_reference.py` scores every model in one or more AF3
-folders with both this app and the reference `ipsae.py` (version 4) from
-[DunbrackLab/IPSAE](https://github.com/DunbrackLab/IPSAE), PAE cutoff 10 Å:
+`validation/ipsae_vs_reference.py` scores every chain pair of every model in one
+or more AF3 folders with both this app and the reference `ipsae.py` (version 4) from
+[DunbrackLab/IPSAE](https://github.com/DunbrackLab/IPSAE), PAE cutoff 10 Å
+(`--top`: top-ranked model only):
 
 ```bash
 curl -LO https://raw.githubusercontent.com/DunbrackLab/IPSAE/main/ipsae.py
@@ -306,7 +327,13 @@ python validation/ipsae_vs_reference.py ipsae.py /path/to/AF3   # your own folde
 
 On the 7 models of the example data the largest difference is 4.7×10⁻⁷. The
 same agreement (below 5×10⁻⁷) was found for the 5 models of an AF2-multimer
-prediction with PAE CSVs (ARL13B–INPP5E, not bundled).
+prediction with PAE CSVs (ARL13B–INPP5E, not bundled), and for all 16 chain
+pairs of three multi-chain AF3 predictions (CCDC198 with IFT46–IFT56 and with
+IFT88–IFT70–IFT52–IFT46; a KIF7 dimer with one prey), largest difference
+4.3×10⁻⁷, and for the 21 chain pairs of a KCTD10/IFT25/IFT27 2:2:2 complex
+with GTP and Mg²⁺ and a KCTD10 homotetramer (4.4×10⁻⁷). For a 2:2
+AlphaFold-Multimer prediction (CROCC/CEP250, PAE CSVs) all 30 chain pairs of
+the five models agree to the four decimals the app stores.
 
 ## How to cite
 

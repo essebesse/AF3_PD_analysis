@@ -50,6 +50,52 @@ def _auto_merge_if_needed(af3_folder: str) -> bool:
             return False
 
 
+def _max_chain_count(af3_folder: str, preds: list, cache_file: Path) -> int:
+    """Largest number of chains in a prediction of this folder. From the
+    analysis cache (polymer chains) when there is one; otherwise from the
+    top-model summary of the first 50 predictions (all chains, ligands
+    included) or the chains of ranked_0.pdb for AF2."""
+    import json
+    if cache_file.exists():
+        # Only conclusive when it shows more than two chains: caches written
+        # before n_chains existed, or before predictions were added, do not.
+        try:
+            with open(cache_file) as f:
+                n_cache = max((r.get('n_chains') or 0 for r in json.load(f)), default=0)
+            if n_cache > 2:
+                return n_cache
+        except Exception:
+            pass
+    n_max = 0
+    for p in preds[:50]:
+        d = Path(p['prediction_dir'])
+        try:
+            if p.get('format') in ('af2', 'alphapulldown'):
+                from core.af2_pae import af2_work_dir
+                import gemmi
+                wd = af2_work_dir(d)
+                if wd is not None:
+                    n_max = max(n_max, len(gemmi.read_structure(str(wd / "ranked_0.pdb"))[0]))
+                continue
+            sf = next(iter(sorted(d.glob('*summary_confidences*.json'))), None)
+            if sf is not None:
+                with open(sf) as f:
+                    n_max = max(n_max, len(json.load(f).get('chain_iptm') or []))
+        except Exception:
+            continue
+    return n_max
+
+
+def _cached_bait_override(cache_file: Path) -> str:
+    """Bait override stored with the last analysis of this folder, if any."""
+    import json
+    try:
+        with open(cache_file) as f:
+            return next((r['bait_override'] for r in json.load(f) if r.get('bait_override')), '')
+    except Exception:
+        return ''
+
+
 def show_analyze(project_path: str, af3_folder: str):
     """Display the Analyze step."""
 
@@ -109,16 +155,36 @@ def show_analyze(project_path: str, af3_folder: str):
 
     st.divider()
 
+    # Bait chains for complexes with more than two chains (stored with the results)
+    bait_override = ''
+    if _max_chain_count(af3_folder, _preds, cache_file) > 2:
+        st.subheader("Bait chains")
+        prev = _cached_bait_override(cache_file)
+        raw = st.text_input(
+            "Bait chains (optional), e.g. A,B:",
+            value=prev,
+            key=f"bait_override_input_{af3_folder}",
+            help=("Some predictions have more than two chains. Every chain pair is scored; the "
+                  "row per model shows the bait-prey pair with the highest ipSAE. Default bait: "
+                  "chain A and its copies (identical sequence); with _with_ in the folder name, "
+                  "all chains except the last protein and its copies. Enter chain IDs here to "
+                  "set the bait chains for every prediction in this folder."),
+        )
+        from core.analyzer import parse_bait_override
+        bait_override = ','.join(c for c in parse_bait_override(raw) if c.isalnum())
+        if prev:
+            st.caption(f"The current results were analysed with bait chains {prev}.")
+
     # The SLURM tab only appears on machines where sbatch is available.
     from core.slurm_config import slurm_available
     if slurm_available():
         tab_local, tab_slurm = st.tabs(["🖥️ Local (this machine)", "🖧 SLURM Cluster"])
         with tab_local:
-            show_local_execution(project_path, af3_folder, pred_count, dominant_format)
+            show_local_execution(project_path, af3_folder, pred_count, dominant_format, bait_override)
         with tab_slurm:
-            show_slurm_execution(project_path, af3_folder, pred_count)
+            show_slurm_execution(project_path, af3_folder, pred_count, bait_override)
     else:
-        show_local_execution(project_path, af3_folder, pred_count, dominant_format)
+        show_local_execution(project_path, af3_folder, pred_count, dominant_format, bait_override)
 
 
 def _format_duration(seconds: float) -> str:
@@ -161,7 +227,7 @@ def _estimate_local_runtime(pred_count: int, num_cpus: int, analyze_all: bool,
 
 
 def show_local_execution(project_path: str, af3_folder: str,
-                          pred_count: int, dominant_format: str):
+                          pred_count: int, dominant_format: str, bait_override: str = ''):
     """Display local execution options."""
 
     st.subheader("🖥️ Local Execution")
@@ -186,8 +252,8 @@ def show_local_execution(project_path: str, af3_folder: str,
                 help=(
                     "Analyze only predictions not yet in the cache — useful when "
                     "new predictions were added to a folder that was already run. "
-                    "Leave unchecked if you changed the PAE cutoff or the all-models "
-                    "option, otherwise the cache will mix results from different settings."
+                    "Leave unchecked if you changed the PAE cutoff, the all-models "
+                    "option or the bait chains, otherwise the cache will mix results from different settings."
                 ),
             )
 
@@ -227,7 +293,7 @@ def show_local_execution(project_path: str, af3_folder: str,
         btn_label = f"Start Local Analysis ({n_to_run} predictions)"
     if st.button(btn_label, type="primary", disabled=(n_to_run == 0)):
         run_local_analysis(project_path, af3_folder, num_cpus, pae_cutoff,
-                           analyze_all, skip_cached)
+                           analyze_all, skip_cached, bait_override)
 
 
 def write_summary_txt(results: list, out_path: Path, pae_cutoff: float, analyze_all: bool,
@@ -321,7 +387,8 @@ def write_summary_txt(results: list, out_path: Path, pae_cutoff: float, analyze_
 
 
 def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cutoff: float,
-                       analyze_all: bool = True, skip_cached: bool = False):
+                       analyze_all: bool = True, skip_cached: bool = False,
+                       bait_override: str = ''):
     """Run analysis locally with multiprocessing."""
 
     progress_bar = st.progress(0)
@@ -391,7 +458,8 @@ def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cu
 
         analyze_fn = partial(analyze_prediction_all_models,
                              ipsae_pae_cutoff=pae_cutoff,
-                             top_only=not analyze_all)
+                             top_only=not analyze_all,
+                             bait_override=bait_override or None)
 
         all_results = []
         try:
@@ -414,24 +482,28 @@ def run_local_analysis(project_path: str, af3_folder: str, num_cpus: int, pae_cu
             # Worker pipe broke (e.g. Streamlit rerun) — use whatever results came in
             st.warning(f"Pool interrupted — saving {len(all_results)} models collected so far.")
 
-        # Strip sequences from new results before saving (huge and already in data.json)
-        for r in all_results:
-            if 'sequences' in r:
-                del r['sequences']
+        if not all_results:
+            status_container.update(label="No models analysed", state="error")
+            st.error(
+                f"None of the {total} prediction folders gave a result, so nothing was saved. "
+                "Each prediction folder needs AF3 output (ranking_scores.csv, "
+                "summary_confidences.json, confidences.json and model.cif, or "
+                "seed-N_sample-M/ folders), AF3 Server files or AF2 ranked_N.pdb files. "
+                f"First folder tried: {pred_dirs[0]}"
+            )
+            return
 
         # Per-prediction JSON files: only rewrite for predictions we just re-analyzed
         from collections import defaultdict
+        # Grouped by prediction folder: unique even when two predictions in
+        # different sub-folders share a name
         by_pred = defaultdict(list)
         for r in all_results:
-            by_pred[r.get('prediction_name', '')].append(r)
-        pred_dir_map = {d.name: d for d in pred_dirs}
-        for pred_name, entries in by_pred.items():
-            if pred_name:
-                # Fallback path also resolves AF3 Server <name>/<name>/ nesting
-                target_dir = pred_dir_map.get(
-                    pred_name,
-                    resolve_prediction_dir(Path(af3_folder) / pred_name),
-                )
+            by_pred[r.get('prediction_dir') or r.get('prediction_name', '')].append(r)
+        for key, entries in by_pred.items():
+            if key:
+                target_dir = (Path(entries[0]['prediction_dir']) if entries[0].get('prediction_dir')
+                              else resolve_prediction_dir(Path(af3_folder) / key))
                 pred_json = target_dir / "af3_app_analysis.json"
                 try:
                     with open(pred_json, 'w') as pf:
@@ -718,7 +790,8 @@ def _cleanup_slurm_scratch(af3_folder: str):
     st.success(f"Removed {n} SLURM scratch file(s).")
 
 
-def show_slurm_execution(project_path: str, af3_folder: str, pred_count: int):
+def show_slurm_execution(project_path: str, af3_folder: str, pred_count: int,
+                         bait_override: str = ''):
     """Display SLURM cluster submission options."""
     from core.slurm_config import load_slurm_config, CONFIG_FILE, MAX_JOBS
 
@@ -779,7 +852,7 @@ def show_slurm_execution(project_path: str, af3_folder: str, pred_count: int):
 
     if st.button("Submit to SLURM", type="primary"):
         submit_slurm_jobs(af3_folder, int(num_jobs), cpus_per_job, memory,
-                          pae_cutoff, analyze_all, int(max_concurrent), cfg)
+                          pae_cutoff, analyze_all, int(max_concurrent), cfg, bait_override)
 
 
 def _sh_quote(s: str) -> str:
@@ -789,7 +862,7 @@ def _sh_quote(s: str) -> str:
 
 def submit_slurm_jobs(af3_folder: str, num_jobs: int, cpus_per_job: int,
                       memory: str, pae_cutoff: float, analyze_all: bool,
-                      max_concurrent: int, cfg: dict):
+                      max_concurrent: int, cfg: dict, bait_override: str = ''):
     """Split predictions into chunks and submit them as one SLURM job array."""
     from core.scanner import AF3Scanner
     from core.slurm_manager import submit_job
@@ -878,7 +951,8 @@ print(f"Analyzing {{len(pred_dirs)}} predictions with {cpus_per_job} CPUs...")
 
 analyze_fn = partial(analyze_prediction_all_models,
                      ipsae_pae_cutoff={pae_cutoff},
-                     top_only={not analyze_all})
+                     top_only={not analyze_all},
+                     bait_override={(bait_override or None)!r})
 
 all_results = []
 with Pool({cpus_per_job}) as pool:
@@ -889,7 +963,8 @@ with Pool({cpus_per_job}) as pool:
             all_results.extend(result_list)
             pn = result_list[0].get("prediction_name", "")
             if pn:
-                pdir = next((d for d in pred_dirs if d.name == pn), None)
+                pdir = (Path(result_list[0]["prediction_dir"]) if result_list[0].get("prediction_dir")
+                        else next((d for d in pred_dirs if d.name == pn), None))
                 if pdir:
                     try:
                         with open(pdir / "af3_app_analysis.json", "w") as pf:
@@ -963,31 +1038,27 @@ def merge_slurm_results(af3_folder: str, num_chunks: int):
     # is rare and gets written here.
     from collections import defaultdict
     from core.scanner import resolve_prediction_dir
+    # Group by prediction folder (unique even when two predictions in
+    # different sub-folders share a name); old results without
+    # prediction_dir fall back to the name.
     by_pred = defaultdict(list)
     for r in all_results:
-        by_pred[r.get('prediction_name', '')].append(r)
-
-    pred_names = [k for k in by_pred if k]
-
-    # Detect AF3 Server <name>/<name>/ nesting once so the existence
-    # check below can skip resolve_prediction_dir's iterdir() when absent.
-    needs_resolve = any(
-        (af3_path / p).is_dir() and (af3_path / p / p).is_dir()
-        for p in pred_names[:5]   # cheap sample
-    )
+        key = r.get('prediction_dir') or r.get('prediction_name', '')
+        if key:
+            by_pred[key].append(r)
 
     n_backfilled = 0
-    for pred_name in pred_names:
-        if needs_resolve:
-            target_dir = resolve_prediction_dir(af3_path / pred_name)
+    for key, entries in by_pred.items():
+        if entries[0].get('prediction_dir'):
+            target_dir = Path(entries[0]['prediction_dir'])
         else:
-            target_dir = af3_path / pred_name
+            target_dir = resolve_prediction_dir(af3_path / key)
         pred_json = target_dir / "af3_app_analysis.json"
         if pred_json.exists():
             continue   # worker already wrote it
         try:
             with open(pred_json, 'w') as pf:
-                json.dump(by_pred[pred_name], pf)
+                json.dump(entries, pf)
             n_backfilled += 1
         except OSError:
             pass

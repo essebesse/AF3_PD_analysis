@@ -14,6 +14,12 @@ from matplotlib.colors import LinearSegmentedColormap
 from typing import List, Optional, Tuple, Dict
 
 
+def _is_small_chain(length: int, total: int) -> bool:
+    """Ions and small ligands (a few tokens): drawn, but given no tick or name
+    label, which would otherwise overlap those of the neighbouring chain."""
+    return length < max(5, 0.03 * total)
+
+
 def create_green_white_cmap():
     """Green (low PAE = high confidence) to white (high PAE = low confidence)."""
     colors = ['#006400', '#228B22', '#32CD32', '#90EE90', '#F0FFF0', '#FFFFFF']
@@ -83,6 +89,8 @@ def plot_pae_matrix(pae_matrix: np.ndarray,
 
     for chain_idx, (name, length) in enumerate(zip(chain_names, chain_lengths)):
         offset = boundaries[chain_idx]
+        if _is_small_chain(length, total):
+            continue
         raw_interval = max(1, length // 4)
         nice_values = [10, 20, 50, 100, 200, 500, 1000]
         interval = nice_values[0]
@@ -130,6 +138,8 @@ def plot_pae_matrix(pae_matrix: np.ndarray,
     ax.set_ylabel('Residue Number', fontsize=12, fontweight='bold')
 
     for i, (name, length) in enumerate(zip(chain_names, chain_lengths)):
+        if _is_small_chain(length, total):
+            continue
         center = boundaries[i] + length / 2
         # Use annotate with axes fraction for consistent placement below plot
         ax.annotate(name, xy=(center, 0), xycoords=('data', 'axes fraction'),
@@ -266,6 +276,7 @@ def plot_all_models_comparison(pae_matrices: List[np.ndarray],
     boundaries = [0]
     for length in chain_lengths:
         boundaries.append(boundaries[-1] + length)
+    total = boundaries[-1]
 
     im = None
     for i in range(n_models):
@@ -302,31 +313,46 @@ def plot_all_models_comparison(pae_matrices: List[np.ndarray],
         # Minimal ticks: residue 1 at the origin and the last residue of each
         # chain (chain-local numbering). Labelling both sides of a chain
         # boundary made the two labels overlap.
-        tick_positions = [0] + [b - 1 for b in boundaries[1:]]
-        tick_labels_list = ['1'] + [str(boundaries[i + 1] - boundaries[i])
-                                    for i in range(len(boundaries) - 1)]
+        # Ions/ligands (small chains) get no tick: their labels sat on top
+        # of the neighbouring chain's.
+        tick_positions = [0]
+        tick_labels_list = ['1']
+        for j, length in enumerate(chain_lengths):
+            if not _is_small_chain(length, total):
+                tick_positions.append(boundaries[j + 1] - 1)
+                tick_labels_list.append(str(length))
         ax.set_xticks(tick_positions)
         ax.set_xticklabels(tick_labels_list, fontsize=8)
         ax.set_yticks(tick_positions)
         ax.set_yticklabels(tick_labels_list, fontsize=8)
 
-        # Chain name labels
+        # Chain name labels, below the tick labels (axes coordinates, so the
+        # offset does not depend on the matrix size)
         for j, (name, length) in enumerate(zip(chain_names, chain_lengths)):
+            if _is_small_chain(length, total):
+                continue
             center = boundaries[j] + length / 2
-            ax.text(center, -boundaries[-1] * 0.06, name, ha='center',
-                    fontsize=8, fontweight='bold')
+            ax.annotate(name, xy=(center, 0), xycoords=('data', 'axes fraction'),
+                        xytext=(0, -20), textcoords='offset points', ha='center',
+                        fontsize=8, fontweight='bold', annotation_clip=False)
 
     # Hide unused subplots
     for i in range(n_models, len(axes)):
         fig.delaxes(axes[i])
 
-    # Shared colorbar
-    if im is not None:
-        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-        cbar = fig.colorbar(im, cax=cbar_ax)
-        cbar.set_label('PAE (Angstrom)', rotation=270, labelpad=20, fontsize=12)
+    # Fixed margins in inches: fractions of the figure height made the
+    # colorbar and the top margin grow with the number of models (50 models =
+    # a 60-inch figure with a 40-inch colorbar).
+    height = fig.get_figheight()
+    fig.subplots_adjust(left=0.07, right=0.88, top=1 - 0.5 / height,
+                        bottom=0.6 / height, wspace=0.35, hspace=0.6)
 
-    plt.tight_layout(rect=[0, 0, 0.9, 0.96])
+    # Shared colorbar, 2.8 inches tall, beside the first row
+    if im is not None:
+        cb_h = min(2.8, height - 1.2)
+        cbar_ax = fig.add_axes([0.91, 1 - (0.6 + cb_h) / height, 0.018, cb_h / height])
+        cbar = fig.colorbar(im, cax=cbar_ax)
+        cbar.set_label('PAE (Angstrom)', rotation=270, labelpad=15, fontsize=10)
     return fig
 
 

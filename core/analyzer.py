@@ -81,6 +81,7 @@ class CIFParser:
         self.atoms = []
         self.chain_mapping = {}
         self.verbose = verbose
+        self.structure = None   # gemmi.Structure, kept for entity IDs
 
     def parse_atoms(self) -> bool:
         """Parse atomic coordinates from CIF file."""
@@ -93,6 +94,7 @@ class CIFParser:
 
         if len(structure) == 0:
             return False
+        self.structure = structure
 
         # Use the first model; AF3 always emits a single model per CIF.
         model = structure[0]
@@ -274,21 +276,33 @@ def polymer_chain_ids(confidences: Dict) -> List[str]:
     """Chain IDs (in token order) of polymer chains (protein, DNA, RNA).
 
     AF3 uses one token per residue for polymers and one token per atom for
-    ligands and ions, so a ligand chain has all tokens on one residue number
-    and an ion a single token. A chain counts as a polymer when its tokens
-    span more than one residue number. Without token_res_ids (not expected)
-    every chain is treated as a polymer.
+    ligands and ions. With atom_chain_ids (AF3 confidences), a chain counts
+    as a polymer when it has more atoms than tokens; ligand and ion chains
+    have exactly one atom per token, also when several ions share one chain
+    (3 Ca2+ entered as one ligand: one chain, residue numbers 1-3).
+    Otherwise (the AF2 path, proteins only) a chain counts as a polymer when
+    its tokens span more than one residue number. Without either field every
+    chain is treated as a polymer.
     """
     chains = confidences.get('token_chain_ids', [])
     res_ids = confidences.get('token_res_ids', [])
+    atom_chains = confidences.get('atom_chain_ids', [])
     order: List[str] = []
     residues: Dict[str, set] = {}
+    n_tokens: Dict[str, int] = {}
     for i, c in enumerate(chains):
         if c not in residues:
             order.append(c)
             residues[c] = set()
+            n_tokens[c] = 0
+        n_tokens[c] += 1
         if i < len(res_ids):
             residues[c].add(res_ids[i])
+    if atom_chains:
+        n_atoms: Dict[str, int] = {}
+        for c in atom_chains:
+            n_atoms[c] = n_atoms.get(c, 0) + 1
+        return [c for c in order if n_atoms.get(c, 0) > n_tokens[c]]
     if not res_ids:
         return order
     return [c for c in order if len(residues[c]) > 1]
@@ -307,30 +321,6 @@ def interface_chain_pair(confidences: Dict) -> Tuple[Optional[str], Optional[str
     a = pair[0] if len(pair) > 0 else None
     b = pair[1] if len(pair) > 1 else None
     return a, b
-
-
-def chain_pair_fields(confidences: Dict, summary: Dict) -> Dict:
-    """Which chains a record scores, for display.
-
-    ipSAE, iPLDDT and contacts are for the scored pair only, while the
-    summary iPTM covers the whole complex. With more than two polymer chains
-    (e.g. a 2:2 job, where A and B are both copies of the first protein) the
-    pair's own iPTM comes from chain_pair_iptm.
-    """
-    a, b = interface_chain_pair(confidences)
-    chains = list(dict.fromkeys(confidences.get('token_chain_ids', [])))
-    fields = {
-        'chain_pair': f"{a}:{b}" if a and b else None,
-        'n_chains': len(polymer_chain_ids(confidences)),
-        'pair_iptm': None,
-    }
-    cpi = summary.get('chain_pair_iptm')
-    if cpi and a in chains and b in chains:
-        try:
-            fields['pair_iptm'] = float(cpi[chains.index(a)][chains.index(b)])
-        except (IndexError, TypeError, ValueError):
-            pass
-    return fields
 
 
 def _structure_pair(parser_chain_ids: List[str], confidences: Dict) -> Tuple[Optional[str], Optional[str]]:
@@ -405,99 +395,340 @@ def calculate_interface_contacts(cif_path: Path, confidences: Dict,
     return contacts
 
 
-def _pae_interface_metrics(struct_path: Optional[Path], confidences: Dict,
-                           pae_matrix: np.ndarray,
-                           chain_a_indices: List[int],
-                           chain_b_indices: List[int]) -> Tuple[int, int, int, float]:
-    """PAE-binned interface contacts and interface pLDDT for chains A/B.
+def chain_token_indices(confidences: Dict) -> Dict[str, List[int]]:
+    """Token indices of every chain, chains in order of first appearance."""
+    out: Dict[str, List[int]] = {}
+    for i, c in enumerate(confidences.get('token_chain_ids', [])):
+        out.setdefault(c, []).append(i)
+    return out
+
+
+def chain_entities(structure, chain_ids: List[str]) -> Dict[str, str]:
+    """Chain ID -> molecule ID; copies of one molecule share the ID.
+
+    Copies are chains with identical residue sequences. mmCIF entity IDs
+    (``_struct_asym.entity_id``) alone are not enough: when the same protein
+    is entered twice as separate AF3 inputs, its copies get two entity IDs.
+    The ID shown is the mmCIF entity ID of the first chain with that sequence;
+    without entity IDs (AF2 PDB files) sequences are numbered 1, 2, ...
+    """
+    if structure is None or len(structure) == 0:
+        return {}
+    sub_to_ent = {}
+    for ent in structure.entities:
+        for sub in ent.subchains:
+            sub_to_ent[sub] = ent.name
+    by_seq: Dict[tuple, str] = {}
+    out: Dict[str, str] = {}
+    for chain in structure[0]:
+        c = chain.name
+        if c not in chain_ids or c in out:
+            continue
+        seq = tuple(r.name for r in chain)
+        if seq not in by_seq:
+            ent = next((sub_to_ent[r.subchain] for r in chain if r.subchain in sub_to_ent), None)
+            if ent is None or ent in by_seq.values():
+                ent = str(len(by_seq) + 1)
+                while ent in by_seq.values():
+                    ent += "'"
+            by_seq[seq] = ent
+        out[c] = by_seq[seq]
+    return out
+
+
+def parse_bait_override(value) -> List[str]:
+    """'A,B' / 'A B' / ['A', 'B'] -> ['A', 'B']; empty -> []."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = re.split(r'[\s,;]+', value)
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def assign_bait_chains(polymers: List[str], entities: Dict[str, str],
+                       folder_name: str = '', override=None) -> List[str]:
+    """Bait chains among the polymer chains (the rest is prey).
+
+    1. ``override`` (e.g. 'A,B'): those chains, if any of them is a polymer chain.
+    2. Folder name with ``_with_`` (AlphaPulldown ``bait1_bait2_with_prey``):
+       the last polymer chain is the prey, together with its copies (same
+       entity); all other polymer chains are bait.
+    3. Otherwise the first polymer chain and all its copies.
+    """
+    if not polymers:
+        return []
+    chosen = [c for c in parse_bait_override(override) if c in polymers]
+    if chosen:
+        return chosen
+
+    def ent(c):
+        return entities.get(c, f"chain:{c}")
+
+    if '_with_' in (folder_name or '').lower() and len(polymers) > 1:
+        prey_ent = ent(polymers[-1])
+        bait = [c for c in polymers if ent(c) != prey_ent]
+        return bait or polymers[:-1]
+    first = ent(polymers[0])
+    return [c for c in polymers if ent(c) == first]
+
+
+def pair_role(a: str, b: str, bait: List[str]) -> str:
+    n = (a in bait) + (b in bait)
+    return {2: 'bait-bait', 1: 'bait-prey', 0: 'prey-prey'}[n]
+
+
+def _scored_chains(confidences: Dict) -> List[str]:
+    """Chains whose pairs are scored: the polymer chains, or all chains when
+    there are fewer than two polymer chains (as interface_chain_pair)."""
+    chains = polymer_chain_ids(confidences)
+    if len(chains) < 2:
+        chains = list(dict.fromkeys(confidences.get('token_chain_ids', [])))
+    return chains
+
+
+class _StructureIndex:
+    """One parse of a model's structure file, reused for every chain pair:
+    per chain the sorted residue numbers and their Cβ (Cα fallback)
+    coordinates, and per atom a residue key aligned with ``atom_plddts``."""
+
+    def __init__(self, struct_path: Optional[Path]):
+        self.ok = False
+        self.structure = None
+        self.chain_ids: List[str] = []
+        self.residues: Dict[str, List[int]] = {}
+        self.coords: Dict[str, np.ndarray] = {}
+        self.atom_keys: List[tuple] = []
+        if struct_path is None or not Path(struct_path).exists():
+            return
+        parser = CIFParser(str(struct_path))
+        if not parser.parse_atoms():
+            return
+        self.structure = parser.structure
+        cb: Dict[tuple, tuple] = {}
+        res_sets: Dict[str, set] = {}
+        for atom in parser.atoms:
+            key = (atom['chain_id'], atom['seq_id'])
+            self.atom_keys.append(key)
+            if key[0] not in res_sets:
+                res_sets[key[0]] = set()
+                self.chain_ids.append(key[0])
+            res_sets[key[0]].add(key[1])
+            name = atom['atom_name']
+            if name == 'CB' or (name == 'CA' and key not in cb):
+                cb[key] = (atom['x'], atom['y'], atom['z'])
+        nan3 = (np.nan, np.nan, np.nan)
+        for c in self.chain_ids:
+            res = sorted(res_sets[c])
+            self.residues[c] = res
+            self.coords[c] = np.array([cb.get((c, r), nan3) for r in res], dtype=float).reshape(-1, 3)
+        self.ok = True
+
+
+def _pair_interface_metrics(sidx: _StructureIndex, confidences: Dict, pae_matrix: np.ndarray,
+                            chain_a: str, chain_b: str, idx_a: List[int], idx_b: List[int],
+                            atom_plddts: Optional[np.ndarray] = None,
+                            atom_res_ids: Optional[np.ndarray] = None,
+                            res_id_of: Optional[Dict[tuple, int]] = None) -> Tuple[int, int, int, float]:
+    """PAE-binned interface contacts and interface pLDDT for one chain pair.
 
     A contact is an inter-chain residue pair with Cβ–Cβ (Cα for Gly) ≤ 8 Å and
     PAE(a→b) ≤ 3 / 5 / 8 Å. Interface pLDDT is the mean per-atom pLDDT over
-    residues in contacts with PAE ≤ 6 Å. Works for AF3 CIF and AF2 PDB files
-    (``confidences`` from ``load_af2_confidences`` for the latter).
+    residues in contacts with PAE ≤ 6 Å. The i-th residue (sorted residue
+    number) of a chain in the structure is the chain's i-th token.
 
-    Returns ``(pae3, pae5, pae8, interface_plddt)``; zeros if the structure is
-    missing or has fewer than two chains.
+    Returns ``(pae3, pae5, pae8, interface_plddt)``; zeros if either chain is
+    missing from the structure.
     """
-    contacts_pae3 = contacts_pae5 = contacts_pae8 = 0
-    interface_plddt = 0.0
-    if struct_path is None or not Path(struct_path).exists():
+    if not sidx.ok or chain_a not in sidx.residues or chain_b not in sidx.residues:
         return 0, 0, 0, 0.0
-    parser = CIFParser(str(struct_path))
-    if not parser.parse_atoms():
-        return 0, 0, 0, 0.0
-    chain_ids = parser.get_chain_ids()
-    if len(chain_ids) < 2:
-        return 0, 0, 0, 0.0
-
-    chain_a_id, chain_b_id = _structure_pair(chain_ids, confidences)
-    chain_a_res = parser.get_chain_residues(chain_a_id)
-    chain_b_res = parser.get_chain_residues(chain_b_id)
-
-    # (chain_id, seq_id) -> Cβ (Cα fallback) coordinate
-    cb_coords: Dict[tuple, tuple] = {}
-    for atom in parser.atoms:
-        key = (atom['chain_id'], atom['seq_id'])
-        name = atom['atom_name']
-        if name == 'CB' or (name == 'CA' and key not in cb_coords):
-            cb_coords[key] = (atom['x'], atom['y'], atom['z'])
-
-    interface_residue_indices: Set[int] = set()
     n_rows, n_cols = pae_matrix.shape
-    for i, res_a in enumerate(chain_a_res):
-        a_idx = chain_a_indices[i] if i < len(chain_a_indices) else -1
-        if a_idx < 0 or a_idx >= n_rows:
-            continue
-        coord_a = cb_coords.get((chain_a_id, res_a))
-        if coord_a is None:
-            continue
-        for j, res_b in enumerate(chain_b_res):
-            b_idx = chain_b_indices[j] if j < len(chain_b_indices) else -1
-            if b_idx < 0 or b_idx >= n_cols:
-                continue
-            pae_val = pae_matrix[a_idx, b_idx]   # PAE check first: cheap
-            if pae_val > 8.0:
-                continue
-            coord_b = cb_coords.get((chain_b_id, res_b))
-            if coord_b is None:
-                continue
-            dx = coord_a[0] - coord_b[0]
-            dy = coord_a[1] - coord_b[1]
-            dz = coord_a[2] - coord_b[2]
-            if (dx*dx + dy*dy + dz*dz) ** 0.5 > 8.0:
-                continue
-            if pae_val <= 3:
-                contacts_pae3 += 1
-            if pae_val <= 5:
-                contacts_pae5 += 1
-            contacts_pae8 += 1
-            if pae_val <= 6.0:
-                interface_residue_indices.add(a_idx)
-                interface_residue_indices.add(b_idx)
 
-    atom_plddts = confidences.get('atom_plddts', [])
-    if len(atom_plddts) and interface_residue_indices:
-        token_chain_ids = confidences.get('token_chain_ids', [])
-        token_res_ids = confidences.get('token_res_ids', [])
-        interface_residues = {
-            (token_chain_ids[k], token_res_ids[k])
-            for k in interface_residue_indices
-            if k < len(token_chain_ids) and k < len(token_res_ids)
-        }
-        # atom_plddts is in structure-file atom order, same as parser.atoms
-        values = [
-            float(atom_plddts[n])
-            for n, atom in enumerate(parser.atoms[:len(atom_plddts)])
-            if (atom['chain_id'], atom['seq_id']) in interface_residues
-        ]
-        if values:
-            interface_plddt = float(np.mean(values))
+    def side(chain, idx, limit):
+        m = min(len(sidx.residues[chain]), len(idx))
+        tok = np.asarray(idx[:m], dtype=int)
+        xyz = sidx.coords[chain][:m]
+        keep = (tok >= 0) & (tok < limit)
+        return tok[keep], xyz[keep]
 
-    return contacts_pae3, contacts_pae5, contacts_pae8, interface_plddt
+    ta, xa = side(chain_a, idx_a, n_rows)
+    tb, xb = side(chain_b, idx_b, n_cols)
+    if len(ta) == 0 or len(tb) == 0:
+        return 0, 0, 0, 0.0
+    pae = pae_matrix[np.ix_(ta, tb)]
+    d2 = ((xa[:, 0, None] - xb[None, :, 0]) ** 2
+          + (xa[:, 1, None] - xb[None, :, 1]) ** 2
+          + (xa[:, 2, None] - xb[None, :, 2]) ** 2)
+    with np.errstate(invalid='ignore'):
+        contact = (pae <= 8.0) & (np.sqrt(d2) <= 8.0)   # NaN (no Cβ/Cα) -> False
+    pae3 = int(np.count_nonzero(contact & (pae <= 3)))
+    pae5 = int(np.count_nonzero(contact & (pae <= 5)))
+    pae8 = int(np.count_nonzero(contact))
+
+    interface_plddt = 0.0
+    strong = contact & (pae <= 6.0)
+    if atom_plddts is not None and len(atom_plddts) and strong.any():
+        rows, cols = np.nonzero(strong)
+        tokens = set(ta[np.unique(rows)].tolist()) | set(tb[np.unique(cols)].tolist())
+        tc = confidences.get('token_chain_ids', [])
+        tr = confidences.get('token_res_ids', [])
+        ids = {res_id_of[(tc[k], tr[k])] for k in tokens
+               if k < len(tc) and k < len(tr) and (tc[k], tr[k]) in res_id_of}
+        if ids:
+            mask = np.isin(atom_res_ids, list(ids))
+            if mask.any():
+                interface_plddt = float(np.mean(atom_plddts[mask]))
+    return pae3, pae5, pae8, interface_plddt
+
+
+def _pair_iptm(summary: Optional[Dict], all_chains: List[str], a: str, b: str) -> Optional[float]:
+    cpi = (summary or {}).get('chain_pair_iptm')
+    if not cpi or a not in all_chains or b not in all_chains:
+        return None
+    try:
+        v = cpi[all_chains.index(a)][all_chains.index(b)]
+        return float(v) if v is not None else None
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _summary_pair(pairs: List[Dict], key: str = 'ipsae') -> Optional[Dict]:
+    """Best bait–prey pair by ``key`` (first one on ties); if there is no
+    bait–prey pair (e.g. a homodimer), the best pair of any role."""
+    pool = [p for p in pairs if p['role'] == 'bait-prey'] or pairs
+    if not pool:
+        return None
+    return max(pool, key=lambda p: p.get(key) or 0)   # max keeps the first on ties
+
+
+SUMMARY_PAIR_FIELDS = ('ipsae', 'interface_plddt', 'contacts_pae3', 'contacts_pae5',
+                       'contacts_pae8', 'pair_iptm')
+
+
+def analyze_model_pairs(struct_path: Optional[Path], confidences: Dict,
+                        summary: Optional[Dict], pae_matrix: np.ndarray,
+                        folder_name: str = '', bait_override=None,
+                        ipsae_pae_cutoff: float = 10.0) -> Optional[Dict]:
+    """Interface metrics for every pair of polymer chains of one model.
+
+    Returns the record fields: the summary pair (best bait–prey pair by
+    ipSAE) in ``ipsae``, ``interface_plddt``, ``contacts_pae3/5/8``,
+    ``chain_pair``, ``pair_iptm``; plus ``n_chains``, ``pairs`` (one entry per
+    chain pair), ``bait_chains`` and ``chain_entities``. ``None`` when fewer
+    than two chains are present.
+    """
+    tok = chain_token_indices(confidences)
+    chains = [c for c in _scored_chains(confidences) if tok.get(c)]
+    if len(chains) < 2:
+        return None
+    all_chains = list(tok.keys())
+    sidx = _StructureIndex(struct_path)
+    entities = chain_entities(sidx.structure, chains)
+    bait = assign_bait_chains(chains, entities, folder_name, bait_override)
+
+    atom_plddts = np.asarray(confidences.get('atom_plddts', []), dtype=float)
+    res_id_of: Dict[tuple, int] = {}
+    atom_res_ids = None
+    if sidx.ok and len(atom_plddts):
+        keys = sidx.atom_keys[:len(atom_plddts)]   # atom_plddts is in structure atom order
+        atom_res_ids = np.array([res_id_of.setdefault(k, len(res_id_of)) for k in keys], dtype=int)
+        atom_plddts = atom_plddts[:len(keys)]
+
+    pairs = []
+    for i in range(len(chains)):
+        for j in range(i + 1, len(chains)):
+            a, b = chains[i], chains[j]
+            ab = calculate_asymmetric_ipsae(pae_matrix, tok[a], tok[b], ipsae_pae_cutoff)
+            ba = calculate_asymmetric_ipsae(pae_matrix, tok[b], tok[a], ipsae_pae_cutoff)
+            p3, p5, p8, ipl = _pair_interface_metrics(
+                sidx, confidences, pae_matrix, a, b, tok[a], tok[b],
+                atom_plddts, atom_res_ids, res_id_of)
+            pairs.append({
+                'chains': f"{a}:{b}",
+                'role': pair_role(a, b, bait),
+                'entities': f"{entities.get(a, '?')}:{entities.get(b, '?')}",
+                'ipsae': round(max(ab, ba), 4),
+                'ipsae_ab': round(ab, 4),
+                'ipsae_ba': round(ba, 4),
+                'pair_iptm': _pair_iptm(summary, all_chains, a, b),
+                'contacts_pae3': p3,
+                'contacts_pae5': p5,
+                'contacts_pae8': p8,
+                'interface_plddt': round(float(ipl), 2),
+            })
+    best = _summary_pair(pairs)
+    out = {k: best[k] for k in SUMMARY_PAIR_FIELDS}
+    out.update({
+        'chain_pair': best['chains'],
+        'pair_role': best['role'],
+        'n_chains': len(polymer_chain_ids(confidences)),
+        'pairs': pairs,
+        'bait_chains': bait,
+        'chain_entities': entities,
+    })
+    return out
+
+
+def _spatial_pairs_from_pdb(pdb_path: Path, folder_name: str = '', bait_override=None,
+                            distance_cutoff: float = 8.0) -> Optional[Dict]:
+    """AF2 model without PAE: spatial Cβ–Cβ contacts and B-factor interface
+    pLDDT for every chain pair; summary pair = bait–prey pair with most contacts."""
+    try:
+        structure = gemmi.read_structure(str(pdb_path))
+    except Exception:
+        return None
+    if len(structure) == 0:
+        return None
+    cb_by_chain: Dict[str, List[Tuple[int, float, float, float, float]]] = {}
+    for chain in structure[0]:
+        entries = []
+        for residue in chain:
+            cb = residue.find_atom('CB', '\0') or residue.find_atom('CA', '\0')
+            if cb is not None:
+                entries.append((residue.seqid.num, cb.pos.x, cb.pos.y, cb.pos.z, cb.b_iso))
+        if entries:
+            cb_by_chain[chain.name] = entries
+    chains = list(cb_by_chain)
+    if len(chains) < 2:
+        return None
+    entities = chain_entities(structure, chains)
+    bait = assign_bait_chains(chains, entities, folder_name, bait_override)
+    arr = {c: np.array(v, dtype=float) for c, v in cb_by_chain.items()}
+    pairs = []
+    for i in range(len(chains)):
+        for j in range(i + 1, len(chains)):
+            a, b = chains[i], chains[j]
+            A, B = arr[a], arr[b]
+            d2 = ((A[:, 1, None] - B[None, :, 1]) ** 2 + (A[:, 2, None] - B[None, :, 2]) ** 2
+                  + (A[:, 3, None] - B[None, :, 3]) ** 2)
+            hit = d2 <= distance_cutoff * distance_cutoff
+            n = int(np.count_nonzero(hit))
+            ia, ib = hit.any(axis=1), hit.any(axis=0)
+            vals = list(A[ia, 4]) + list(B[ib, 4])
+            pairs.append({
+                'chains': f"{a}:{b}",
+                'role': pair_role(a, b, bait),
+                'entities': f"{entities.get(a, '?')}:{entities.get(b, '?')}",
+                'ipsae': None, 'ipsae_ab': None, 'ipsae_ba': None, 'pair_iptm': None,
+                'contacts_pae3': None, 'contacts_pae5': None, 'contacts_pae8': None,
+                'contacts_spatial': n,
+                'interface_plddt': round(float(sum(vals)) / len(vals), 2) if vals else None,
+            })
+    best = _summary_pair(pairs, key='contacts_spatial')
+    return {
+        'contacts_spatial': best['contacts_spatial'],
+        'interface_plddt': best['interface_plddt'],
+        'chain_pair': best['chains'],
+        'pair_role': best['role'],
+        'pair_iptm': None,
+        'n_chains': len(chains),
+        'pairs': pairs,
+        'bait_chains': bait,
+        'chain_entities': entities,
+    }
 
 
 def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
-                   ipsae_pae_cutoff: float = 10.0) -> Optional[Dict]:
+                   ipsae_pae_cutoff: float = 10.0, bait_override=None) -> Optional[Dict]:
     """
     Analyze a single seed/sample model.
 
@@ -521,37 +752,10 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
         if not summary:
             return None
 
-        # Load data.json for sequences
-        data_file = pred_dir / f"{prefix}_data.json"
-        if not data_file.exists():
-            data_file = pred_dir / "data.json"
-
-        sequences = {}
-        if data_file.exists():
-            with open(data_file, 'r') as f:
-                data = json.load(f)
-            if 'sequences' in data:
-                for seq_info in data['sequences']:
-                    protein = seq_info.get('protein', {})
-                    if isinstance(protein, dict):
-                        chain_id = protein.get('id', 'unknown')
-                        sequences[chain_id] = protein.get('sequence', '')
-                    else:
-                        # Flat format fallback
-                        chain_id = seq_info.get('protein.id', 'unknown')
-                        sequences[chain_id] = seq_info.get('protein.sequence', '')
-
         # Get PAE matrix and calculate ipSAE
         pae_matrix = np.array(confidences.get('pae', []))
         if pae_matrix.size == 0:
             return None
-
-        _, chain_a_indices, chain_b_indices, _ = extract_chain_indices(confidences)
-
-        if not chain_a_indices or not chain_b_indices:
-            return None
-
-        ipsae = calculate_ipsae(pae_matrix, chain_a_indices, chain_b_indices, ipsae_pae_cutoff)
 
         # Find CIF file for this sample (spatial filtering requires structure)
         sample_dir = pred_dir / f"seed-{seed}_sample-{sample_num}"
@@ -564,11 +768,10 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
         ]
         cif_path = next((p for p in cif_candidates if p.exists()), None)
 
-        contacts_pae3, contacts_pae5, contacts_pae8, interface_plddt = _pae_interface_metrics(
-            cif_path, confidences, pae_matrix, chain_a_indices, chain_b_indices)
-
-        # Calculate fraction disordered
-        fraction_disordered = summary.get('fraction_disordered', 0)
+        pair_fields = analyze_model_pairs(cif_path, confidences, summary, pae_matrix,
+                                          pred_dir.name, bait_override, ipsae_pae_cutoff)
+        if pair_fields is None:
+            return None
 
         return {
             'seed': seed,
@@ -576,16 +779,10 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
             'iptm': float(summary.get('iptm', 0)),
             'ptm': float(summary.get('ptm', 0)),
             'ranking_score': float(summary.get('ranking_score', 0)),
-            'ipsae': round(ipsae, 4),
-            'interface_plddt': round(float(interface_plddt), 2),
-            'contacts_pae3': contacts_pae3,
-            'contacts_pae5': contacts_pae5,
-            'contacts_pae8': contacts_pae8,
-            'fraction_disordered': fraction_disordered,
+            'fraction_disordered': summary.get('fraction_disordered', 0),
             'pae_mean': float(np.mean(pae_matrix)) if pae_matrix.size > 0 else 0,
-            'sequences': sequences,
             'format': 'af3',
-            **chain_pair_fields(confidences, summary),
+            **pair_fields,
         }
 
     except Exception as e:
@@ -594,7 +791,7 @@ def analyze_sample(pred_dir: Path, prefix: str, seed: int, sample_num: int,
 
 
 def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0,
-                                   top_only: bool = False) -> List[Dict]:
+                                   top_only: bool = False, bait_override=None) -> List[Dict]:
     """
     Analyze models in a prediction directory.
 
@@ -610,24 +807,37 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
 
     Args:
         top_only: If True, only analyze the top-ranked model.
+        bait_override: bait chain IDs ('A,B' or a list) for complexes with
+            more than two chains; default rule in assign_bait_chains().
     Returns list of analysis results, one per model.
     """
-    from core.scanner import (resolve_prediction_dir, _is_af3_server_flat,
-                              _is_alphapulldown_format, af3_models_on_disk)
-    pred_dir = resolve_prediction_dir(pred_dir)
+    from core.scanner import resolve_prediction_dir
+    pred_dir = resolve_prediction_dir(Path(pred_dir))
+    override = parse_bait_override(bait_override)
+    results = _analyze_prediction(pred_dir, ipsae_pae_cutoff, top_only, override)
+    for r in results:
+        r['prediction_dir'] = str(pred_dir)   # where to write af3_app_analysis.json
+        r['bait_override'] = ','.join(override) if override else None
+    return results
+
+
+def _analyze_prediction(pred_dir: Path, ipsae_pae_cutoff: float, top_only: bool,
+                        bait_override=None) -> List[Dict]:
+    from core.scanner import (_is_af3_server_flat, _is_alphapulldown_format,
+                              af3_models_on_disk, prediction_file_prefix)
 
     if _is_af3_server_flat(pred_dir):
-        return _analyze_server_flat(pred_dir, ipsae_pae_cutoff, top_only)
+        return _analyze_server_flat(pred_dir, ipsae_pae_cutoff, top_only, bait_override)
 
     if _is_alphapulldown_format(pred_dir):
-        return _analyze_alphapulldown(pred_dir, top_only, ipsae_pae_cutoff)
+        return _analyze_alphapulldown(pred_dir, top_only, ipsae_pae_cutoff, bait_override)
 
     try:
         results = []
         pred_name = pred_dir.name
-        prefix = pred_name
+        prefix = prediction_file_prefix(pred_dir)   # differs from pred_name if renamed
 
-        ranking_file = pred_dir / f"{pred_name}_ranking_scores.csv"
+        ranking_file = pred_dir / f"{prefix}_ranking_scores.csv"
         if not ranking_file.exists():
             ranking_file = pred_dir / "ranking_scores.csv"
         if not ranking_file.exists():
@@ -663,7 +873,7 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
             seed, sample = m['seed'], m['sample']
             is_top = (seed == top_seed and sample == top_sample)
 
-            result = analyze_sample(pred_dir, prefix, seed, sample, ipsae_pae_cutoff)
+            result = analyze_sample(pred_dir, prefix, seed, sample, ipsae_pae_cutoff, bait_override)
             if result:
                 result['is_top_ranked'] = is_top
                 result['prediction_name'] = pred_name
@@ -678,7 +888,7 @@ def analyze_prediction_all_models(pred_dir: Path, ipsae_pae_cutoff: float = 10.0
 
 
 def _analyze_server_flat(pred_dir: Path, ipsae_pae_cutoff: float = 10.0,
-                          top_only: bool = False) -> List[Dict]:
+                          top_only: bool = False, bait_override=None) -> List[Dict]:
     """
     Analyze an AF3 Server flat-format prediction folder.
 
@@ -721,7 +931,7 @@ def _analyze_server_flat(pred_dir: Path, ipsae_pae_cutoff: float = 10.0,
 
     results = []
     for idx in indices_to_run:
-        result = _analyze_server_model(pred_dir, prefix, idx, ipsae_pae_cutoff)
+        result = _analyze_server_model(pred_dir, prefix, idx, ipsae_pae_cutoff, bait_override)
         if result:
             result['is_top_ranked'] = (idx == top_idx)
             result['prediction_name'] = pred_name
@@ -731,7 +941,7 @@ def _analyze_server_flat(pred_dir: Path, ipsae_pae_cutoff: float = 10.0,
 
 
 def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
-                           ipsae_pae_cutoff: float = 10.0) -> Optional[Dict]:
+                           ipsae_pae_cutoff: float = 10.0, bait_override=None) -> Optional[Dict]:
     """
     Analyze a single model from an AF3 Server flat-format folder.
     """
@@ -754,17 +964,13 @@ def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
         if pae_matrix.size == 0:
             return None
 
-        _, chain_a_indices, chain_b_indices, _ = extract_chain_indices(confidences)
-        if not chain_a_indices or not chain_b_indices:
-            return None
-
-        ipsae = calculate_ipsae(pae_matrix, chain_a_indices, chain_b_indices, ipsae_pae_cutoff)
-
         # CIF file for spatial contact calculation
         cif_path = pred_dir / f"{prefix}_model_{model_idx}.cif"
 
-        contacts_pae3, contacts_pae5, contacts_pae8, interface_plddt = _pae_interface_metrics(
-            cif_path, confidences, pae_matrix, chain_a_indices, chain_b_indices)
+        pair_fields = analyze_model_pairs(cif_path, confidences, summary, pae_matrix,
+                                          pred_dir.name, bait_override, ipsae_pae_cutoff)
+        if pair_fields is None:
+            return None
 
         return {
             'seed': 0,
@@ -772,16 +978,11 @@ def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
             'iptm': float(summary.get('iptm', 0)),
             'ptm': float(summary.get('ptm', 0)),
             'ranking_score': float(summary.get('ranking_score', 0)),
-            'ipsae': round(ipsae, 4),
-            'interface_plddt': round(float(interface_plddt), 2),
-            'contacts_pae3': contacts_pae3,
-            'contacts_pae5': contacts_pae5,
-            'contacts_pae8': contacts_pae8,
             'fraction_disordered': float(summary.get('fraction_disordered', 0)),
             'pae_mean': float(np.mean(pae_matrix)) if pae_matrix.size > 0 else 0,
             'cif_path': str(cif_path) if cif_path.exists() else None,
             'format': 'server_flat',
-            **chain_pair_fields(confidences, summary),
+            **pair_fields,
         }
 
     except Exception as e:
@@ -790,7 +991,7 @@ def _analyze_server_model(pred_dir: Path, prefix: str, model_idx: int,
 
 
 def _analyze_alphapulldown(pred_dir: Path, top_only: bool = False,
-                           ipsae_pae_cutoff: float = 10.0) -> List[Dict]:
+                           ipsae_pae_cutoff: float = 10.0, bait_override=None) -> List[Dict]:
     """Analyze an AF2-multimer prediction folder (AlphaPulldown or AF2).
 
     Reads ``ranking_debug.json`` for per-model iptm+ptm scores. For each
@@ -831,7 +1032,8 @@ def _analyze_alphapulldown(pred_dir: Path, top_only: bool = False,
 
         confidences, pae_problem = load_af2_confidences_checked(work_dir, idx)
         if confidences is not None:
-            r = _analyze_af2_with_pae(pdb_path, confidences, ipsae_pae_cutoff)
+            r = _analyze_af2_with_pae(pdb_path, confidences, ipsae_pae_cutoff,
+                                      pred_name, bait_override)
             if r is not None:
                 r.update({
                     'seed': 0,
@@ -849,7 +1051,8 @@ def _analyze_alphapulldown(pred_dir: Path, top_only: bool = False,
                 results.append(r)
                 continue
 
-        contacts_count, iface_plddt = _interface_metrics_from_pdb(pdb_path)
+        spatial = _spatial_pairs_from_pdb(pdb_path, pred_name, bait_override) or {
+            'contacts_spatial': 0, 'interface_plddt': None}
 
         results.append({
             'seed': 0,
@@ -858,11 +1061,10 @@ def _analyze_alphapulldown(pred_dir: Path, top_only: bool = False,
             'ptm': score,
             'ranking_score': score,
             'ipsae': None,
-            'interface_plddt': round(iface_plddt, 2) if iface_plddt is not None else None,
             'contacts_pae3': None,
             'contacts_pae5': None,
             'contacts_pae8': None,
-            'contacts_spatial': contacts_count,   # CB-CB pairs < 8 Å, no PAE filter
+            **spatial,   # contacts_spatial: Cβ–Cβ pairs ≤ 8 Å, no PAE filter
             'fraction_disordered': 0,
             'pae_mean': None,
             'is_top_ranked': (idx == 0),
@@ -876,83 +1078,17 @@ def _analyze_alphapulldown(pred_dir: Path, top_only: bool = False,
 
 
 def _analyze_af2_with_pae(pdb_path: Path, confidences: Dict,
-                          ipsae_pae_cutoff: float = 10.0) -> Optional[Dict]:
+                          ipsae_pae_cutoff: float = 10.0, folder_name: str = '',
+                          bait_override=None) -> Optional[Dict]:
     """ipSAE, PAE-binned contacts and interface pLDDT for one AF2 model with a
     PAE matrix. Same definitions as the AF3 path."""
     try:
         pae_matrix = np.asarray(confidences['pae'], dtype=float)
-        _, chain_a_indices, chain_b_indices, _ = extract_chain_indices(confidences)
-        if not chain_a_indices or not chain_b_indices:
+        pair_fields = analyze_model_pairs(pdb_path, confidences, None, pae_matrix,
+                                          folder_name, bait_override, ipsae_pae_cutoff)
+        if pair_fields is None:
             return None
-        ipsae = calculate_ipsae(pae_matrix, chain_a_indices, chain_b_indices, ipsae_pae_cutoff)
-        pae3, pae5, pae8, iface_plddt = _pae_interface_metrics(
-            pdb_path, confidences, pae_matrix, chain_a_indices, chain_b_indices)
-        return {
-            'ipsae': round(ipsae, 4),
-            'interface_plddt': round(float(iface_plddt), 2),
-            'contacts_pae3': pae3,
-            'contacts_pae5': pae5,
-            'contacts_pae8': pae8,
-            'pae_mean': float(np.mean(pae_matrix)),
-        }
+        return {**pair_fields, 'pae_mean': float(np.mean(pae_matrix))}
     except Exception as e:
         print(f"Error analyzing AF2 model {pdb_path}: {e}")
         return None
-
-
-def _interface_metrics_from_pdb(pdb_path: Path,
-                                  distance_cutoff: float = 8.0
-                                  ) -> Tuple[int, Optional[float]]:
-    """Spatial interface contact count + mean CB pLDDT (B-factor) for an
-    AF2-multimer PDB. No PAE filtering. Returns ``(n_contacts, mean_plddt)``;
-    mean_plddt is ``None`` if no interface was found.
-    """
-    import gemmi
-    try:
-        structure = gemmi.read_structure(str(pdb_path))
-    except Exception:
-        return 0, None
-    if len(structure) == 0:
-        return 0, None
-    model = structure[0]
-
-    # Collect CB coords per chain (CA fallback for glycine), with B-factor pLDDT
-    cb_by_chain: Dict[str, List[Tuple[int, float, float, float, float]]] = {}
-    for chain in model:
-        entries = []
-        for residue in chain:
-            cb = residue.find_atom('CB', '\0') or residue.find_atom('CA', '\0')
-            if cb is not None:
-                entries.append((
-                    residue.seqid.num,
-                    cb.pos.x, cb.pos.y, cb.pos.z,
-                    cb.b_iso,
-                ))
-        if entries:
-            cb_by_chain[chain.name] = entries
-
-    chain_ids = list(cb_by_chain.keys())
-    if len(chain_ids) < 2:
-        return 0, None
-    a_id, b_id = chain_ids[0], chain_ids[1]
-    a_atoms = cb_by_chain[a_id]
-    b_atoms = cb_by_chain[b_id]
-
-    dist_sq = distance_cutoff * distance_cutoff
-    n_contacts = 0
-    iface_a, iface_b = set(), set()
-    for (ra, ax, ay, az, _) in a_atoms:
-        for (rb, bx, by, bz, _) in b_atoms:
-            dx, dy, dz = ax - bx, ay - by, az - bz
-            if dx*dx + dy*dy + dz*dz <= dist_sq:
-                n_contacts += 1
-                iface_a.add(ra)
-                iface_b.add(rb)
-
-    if not iface_a and not iface_b:
-        return 0, None
-
-    plddts = [bf for (r, _, _, _, bf) in a_atoms if r in iface_a]
-    plddts += [bf for (r, _, _, _, bf) in b_atoms if r in iface_b]
-    mean_plddt = sum(plddts) / len(plddts) if plddts else None
-    return n_contacts, mean_plddt
