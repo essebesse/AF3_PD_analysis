@@ -8,6 +8,10 @@ for ALL models (not just top-ranked), and performing detailed interface analysis
 
 import streamlit as st
 import os
+import shutil
+import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
 # Page configuration (must be first)
@@ -41,6 +45,158 @@ except ImportError as e:
     st.error(f"Failed to import core modules: {e}")
     st.stop()
 
+# ── Native file dialogs ───────────────────────────────────────────────────────
+# Each dialog runs in a separate process: tkinter must own the main thread, and
+# Streamlit runs this script in a worker thread, so calling it in-process can
+# hang or crash the app. The dialog opens on the machine running Streamlit,
+# which is the user's own computer when the app is started locally (./run.sh).
+def pick_folder_dialog(start_dir):
+    """Open the operating system's native folder picker.
+
+    Linux: zenity (GNOME) or kdialog (KDE). macOS: Finder via osascript.
+    Windows, or Linux without either tool: tkinter (native on Windows).
+    Returns (path or None, error or None); cancelling gives (None, None).
+    """
+    title = "Select project folder"
+    # Fallback dialog: tkinter is in the standard library, but on Linux it is a
+    # system package (python3-tk), not a pip one, so it may be missing.
+    tk_script = (
+        "import sys, tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)\n"
+        "print(filedialog.askdirectory(initialdir=sys.argv[1], title=sys.argv[2]))\n"
+    )
+    tk_cmd = [sys.executable, "-c", tk_script, start_dir, title]
+
+    # Pick the dialog that looks native on this system
+    if sys.platform == "darwin":
+        apple = (f'POSIX path of (choose folder with prompt "{title}" '
+                 f'default location (POSIX file "{start_dir}"))')
+        cmd = ["osascript", "-e", apple]
+    elif sys.platform.startswith("linux") and shutil.which("zenity"):
+        # The GTK4 folder chooser (zenity 4) lists files greyed out; a filter
+        # that no file name can match ('*/') hides them, folders stay visible.
+        cmd = ["zenity", "--file-selection", "--directory",
+               f"--title={title}", f"--filename={start_dir.rstrip('/')}/",
+               "--file-filter=Folders | */"]
+    elif sys.platform.startswith("linux") and shutil.which("kdialog"):
+        cmd = ["kdialog", "--getexistingdirectory", start_dir, "--title", title]
+    else:
+        cmd = tk_cmd
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"Could not open folder dialog: {e}"
+    if result.returncode != 0:
+        # zenity, kdialog and osascript exit with 1 when the user cancels
+        if cmd is not tk_cmd and result.returncode == 1:
+            return None, None
+        lines = result.stderr.strip().splitlines()
+        detail = lines[-1] if lines else ""
+        return None, f"Could not open folder dialog. {detail}"
+    # osascript ends folder paths with '/'; drop it so the path matches typed ones
+    path = result.stdout.strip()
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return (path or None), None
+
+
+def pick_zip_files_dialog(start_dir):
+    """Open the native file picker for one or more .zip files.
+
+    Same backends as pick_folder_dialog(). Returns (list of paths, error or None);
+    cancelling gives ([], None).
+    """
+    title = "Select .zip files"
+    # Fallback dialog, as in pick_folder_dialog(); prints one path per line
+    tk_script = (
+        "import sys, tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)\n"
+        "files = filedialog.askopenfilenames(initialdir=sys.argv[1], title=sys.argv[2],\n"
+        "    filetypes=[('ZIP archives', '*.zip *.ZIP')])\n"
+        "print('\\n'.join(files))\n"
+    )
+    tk_cmd = [sys.executable, "-c", tk_script, start_dir, title]
+
+    # Pick the dialog that looks native on this system. Only .zip files are
+    # listed; folders stay visible so the user can navigate to them.
+    if sys.platform == "darwin":
+        # AppleScript returns a list of aliases; join their POSIX paths by line
+        apple = (
+            f'set fs to choose file with prompt "{title}" of type {{"zip"}} '
+            f'default location (POSIX file "{start_dir}") with multiple selections allowed\n'
+            'set out to ""\n'
+            'repeat with f in fs\n'
+            'set out to out & POSIX path of f & linefeed\n'
+            'end repeat\n'
+            'return out'
+        )
+        cmd = ["osascript", "-e", apple]
+    elif sys.platform.startswith("linux") and shutil.which("zenity"):
+        cmd = ["zenity", "--file-selection", "--multiple", "--separator=\n",
+               f"--title={title}", f"--filename={start_dir.rstrip('/')}/",
+               "--file-filter=ZIP archives | *.zip *.ZIP"]
+    elif sys.platform.startswith("linux") and shutil.which("kdialog"):
+        cmd = ["kdialog", "--getopenfilename", start_dir, "*.zip *.ZIP|ZIP archives",
+               "--multiple", "--separate-output", "--title", title]
+    else:
+        cmd = tk_cmd
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return [], f"Could not open file dialog: {e}"
+    if result.returncode != 0:
+        # zenity, kdialog and osascript exit with 1 when the user cancels
+        if cmd is not tk_cmd and result.returncode == 1:
+            return [], None
+        lines = result.stderr.strip().splitlines()
+        detail = lines[-1] if lines else ""
+        return [], f"Could not open file dialog. {detail}"
+    return [p for p in result.stdout.splitlines() if p.strip()], None
+
+
+def extract_zips(zip_paths):
+    """Extract .zip files and return (project folder, messages, errors).
+
+    One zip: extracted to <zip folder>/<zip name>/, which becomes the project.
+    Several: each to <folder of the first zip>/unzipped_predictions/<zip name>/,
+    and unzipped_predictions/ becomes the project. A target folder that already
+    has content is reused, not overwritten.
+    """
+    # Several zips get a shared parent folder instead of being extracted next
+    # to themselves: the zips usually sit in Downloads, and using that as the
+    # project would make the scanner walk everything else stored there.
+    zips = [Path(p) for p in zip_paths]
+    if len(zips) == 1:
+        project = zips[0].parent / zips[0].stem
+        targets = [project]
+    else:
+        project = zips[0].parent / "unzipped_predictions"
+        targets = [project / z.stem for z in zips]
+
+    messages, errors = [], []
+    for z, target in zip(zips, targets):
+        # Reuse an earlier extraction: it may already hold the analysis cache
+        if target.is_dir() and any(target.iterdir()):
+            messages.append(f"`{z.name}`: already extracted, reusing `{target}`")
+            continue
+        try:
+            with zipfile.ZipFile(z) as zf:
+                target.mkdir(parents=True, exist_ok=True)
+                zf.extractall(target)  # strips absolute paths and '..'
+            messages.append(f"`{z.name}`: extracted to `{target}`")
+        except (zipfile.BadZipFile, OSError) as e:
+            errors.append(f"`{z.name}`: {e}")
+
+    # No project when every zip failed before its folder was created
+    if not project.is_dir():
+        return None, messages, errors
+    return str(project), messages, errors
+
+
 # ── Project folder selection ──────────────────────────────────────────────────
 # Initialize browser state — start from the directory the app was launched in
 if 'browser_dir' not in st.session_state:
@@ -73,6 +229,48 @@ else:
     if typed_path and os.path.isdir(typed_path):
         st.session_state['project_path'] = typed_path
         st.rerun()
+
+    # Native dialogs: pick a folder, or one or more .zip files that are
+    # extracted and then used as the project folder
+    col_folder, col_zip, _ = st.columns([1, 1, 3])
+    with col_folder:
+        if st.button("📁 Select folder…"):
+            chosen, err = pick_folder_dialog(st.session_state['browser_dir'])
+            if err:
+                st.error(err)
+            elif chosen:
+                st.session_state['project_path'] = chosen
+                st.rerun()
+    with col_zip:
+        pick_zips = st.button("📦 Select .zip files…")
+    # Handled outside the column so messages use the full page width
+    if pick_zips:
+        zip_paths, err = pick_zip_files_dialog(st.session_state['browser_dir'])
+        if err:
+            st.error(err)
+        elif zip_paths:
+            with st.spinner(f"Extracting {len(zip_paths)} .zip file(s)..."):
+                project, messages, errors = extract_zips(zip_paths)
+            if project and not errors:
+                st.session_state.pop('_zip_result', None)
+                st.session_state['project_path'] = project
+                st.rerun()
+            # Some zips failed: keep the report across reruns so the user can
+            # read it and still continue with the zips that did extract.
+            st.session_state['_zip_result'] = (project, messages, errors)
+
+    # Report from a partly failed extraction, kept until the user continues
+    zip_result = st.session_state.get('_zip_result')
+    if zip_result:
+        project, messages, errors = zip_result
+        for e in errors:
+            st.error(e)
+        for m in messages:
+            st.caption(m)
+        if project and st.button(f"Continue with {project}", key="zip_continue"):
+            st.session_state.pop('_zip_result', None)
+            st.session_state['project_path'] = project
+            st.rerun()
 
     st.markdown("##### Browse folders")
     browse_dir = Path(st.session_state['browser_dir'])
