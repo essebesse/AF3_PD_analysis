@@ -93,7 +93,8 @@ Test project of file symlinks (deleted afterwards): `AF/HsKCTD10_IFT25_27/runs/K
 
 - Fixed: the "Chain pairs" maps (ipSAE, pair iPTM) had no download button.
 - Fixed (also P. Meyke's note 23): Interface Zoom starred every residue pair below the PAE cutoff, with no distance filter (TTC21A–IFT122: 7,288 starred pairs, 25 within 8 Å), so the stars read as contacts. Stars are now only pairs with Cβ–Cβ ≤ 8 Å (`pair_contact_mask()` in `core/analyzer.py`, same definition as the contact counts); legend says so. NCS1–CEP89 test model: 2,805 → 93 stars.
-- Open: upload a .zip or folder instead of typing a path; AlphaJudge `interface_meta_score` as a Results column (all AlphaJudge metrics elsewhere). X. offers to do the AlphaJudge part and asks for GitHub access.
+- Fixed: upload a .zip or folder instead of typing a path
+- Open: AlphaJudge `interface_meta_score` as a Results column (all AlphaJudge metrics elsewhere). X. offers to do the AlphaJudge part and asks for GitHub access.
 
 ### Notes from J. Wang (2026-11-25): declined
 
