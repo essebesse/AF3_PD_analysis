@@ -88,3 +88,9 @@ Test project of file symlinks (deleted afterwards): `AF/HsKCTD10_IFT25_27/runs/K
 - Not bugs (checked on the top models): WFS1 632–654 lies on NCS1 but has PAE ≥ 17.5 Å, so all metrics are 0; Ric8a 130–176 is 8–22 Å from NCS1 in the RIC8A_apo model. Not reproduced: hub list (note 24), zoom jumping back (note 4).
 - Open feature requests: notes 1, 2, 3, 6, 7, 8, 10–14, 17, 19, 20, 22, 23, 25, 26.
 
+
+### Notes from X. (2026-11-25, tested TTC21A + IFT122 + WDR35 + IFT43 at home)
+
+- Fixed: the "Chain pairs" maps (ipSAE, pair iPTM) had no download button.
+- Fixed (also P. Meyke's note 23): Interface Zoom starred every residue pair below the PAE cutoff, with no distance filter (TTC21A–IFT122: 7,288 starred pairs, 25 within 8 Å), so the stars read as contacts. Stars are now only pairs with Cβ–Cβ ≤ 8 Å (`pair_contact_mask()` in `core/analyzer.py`, same definition as the contact counts); legend says so. NCS1–CEP89 test model: 2,805 → 93 stars.
+- Open: upload a .zip or folder instead of typing a path; AlphaJudge `interface_meta_score` as a Results column (all AlphaJudge metrics elsewhere). X. offers to do the AlphaJudge part and asks for GitHub access.

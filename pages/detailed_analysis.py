@@ -599,7 +599,12 @@ def show_detailed(project_path: str, af3_folder: str):
                                              ha='center', va='center', fontsize=6)
                     _fig.tight_layout()
                     st.pyplot(_fig)
+                    _buf = io.BytesIO()
+                    _fig.savefig(_buf, format='png', dpi=150, bbox_inches='tight')
                     plt.close(_fig)
+                    st.download_button("Download chain-pair maps", _buf.getvalue(),
+                                       file_name=f"{selected_pred_name}_s{seed}_m{sample}_chain_pairs.png",
+                                       mime="image/png", key=f"_dl_chain_pairs_{model_key}")
 
                 if confidences is None and _is_af2:
                     st.info(
@@ -636,9 +641,13 @@ def show_detailed(project_path: str, af3_folder: str):
 
                             zoom_plot_key = f"_zoom_plot_{model_key}_{pair_suffix}"
                             if zoom_plot_key not in st.session_state:
+                                from core.analyzer import pair_contact_mask
+                                _mask = (pair_contact_mask(cif_file, pair_ids[0], pair_ids[1],
+                                                           len(chain_a_idx), len(chain_b_idx))
+                                         if cif_file.exists() else None)
                                 fig_zoom = plot_pae_interface_zoom(
                                     pae_matrix, chain_a_idx, chain_b_idx,
-                                    chain_a_name, chain_b_name
+                                    chain_a_name, chain_b_name, contact_mask=_mask
                                 )
                                 buf = io.BytesIO()
                                 fig_zoom.savefig(buf, format='png', dpi=150, bbox_inches='tight')

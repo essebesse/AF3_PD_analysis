@@ -161,10 +161,14 @@ def plot_pae_interface_zoom(pae_matrix: np.ndarray,
                             chain_b_indices: List[int],
                             chain_a_name: str,
                             chain_b_name: str,
-                            pae_cutoff: float = 6.0) -> plt.Figure:
+                            pae_cutoff: float = 6.0,
+                            contact_mask: Optional[np.ndarray] = None) -> plt.Figure:
     """
     Plot zoomed-in PAE for the interface region (chain A vs chain B block).
-    Red dots mark contacts below pae_cutoff.
+    Stars mark residue pairs with PAE below pae_cutoff; with ``contact_mask``
+    (chain A x chain B, True where Cβ–Cβ ≤ 8 Å) only pairs that are also in
+    contact, so the stars are the interface contacts and not every
+    low-PAE pair.
 
     Args:
         pae_matrix: NxN PAE matrix from confidences.json
@@ -217,16 +221,22 @@ def plot_pae_interface_zoom(pae_matrix: np.ndarray,
     ax.set_yticks(yticks)
     ax.set_yticklabels([str(t + 1) for t in yticks], fontsize=8)
 
-    # Mark residue pairs with PAE < 6 and < 3 using stars
-    rows_6, cols_6 = np.where((interface_block < pae_cutoff) & (interface_block >= 3.0))
-    rows_3, cols_3 = np.where(interface_block < 3.0)
+    # Mark residue pairs with PAE < 6 and < 3 using stars; only pairs in
+    # contact (Cβ–Cβ ≤ 8 Å) when a contact mask is given. Without the mask a
+    # large block had thousands of stars, most of them far apart in space.
+    keep = np.ones_like(interface_block, dtype=bool)
+    if contact_mask is not None and contact_mask.shape == interface_block.shape:
+        keep = contact_mask
+    rows_6, cols_6 = np.where((interface_block < pae_cutoff) & (interface_block >= 3.0) & keep)
+    rows_3, cols_3 = np.where((interface_block < 3.0) & keep)
+    what = 'contacts, Cβ–Cβ ≤ 8Å, ' if keep is contact_mask else ''
 
     if len(rows_6) > 0:
         ax.scatter(cols_6, rows_6, marker='*', s=15, c='orange', alpha=0.8,
-                   edgecolors='none', label=f'3 ≤ PAE < {pae_cutoff:.0f}Å ({len(rows_6)})')
+                   edgecolors='none', label=f'{what}3 ≤ PAE < {pae_cutoff:.0f}Å ({len(rows_6)})')
     if len(rows_3) > 0:
         ax.scatter(cols_3, rows_3, marker='*', s=25, c='red', alpha=0.9,
-                   edgecolors='none', label=f'PAE < 3Å ({len(rows_3)})')
+                   edgecolors='none', label=f'{what}PAE < 3Å ({len(rows_3)})')
 
     if len(rows_6) > 0 or len(rows_3) > 0:
         ax.legend(loc='upper right', fontsize=9, framealpha=0.9)

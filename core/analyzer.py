@@ -524,6 +524,24 @@ class _StructureIndex:
         self.ok = True
 
 
+def pair_contact_mask(struct_path: Path, chain_a: str, chain_b: str, n_a: int, n_b: int,
+                      distance_cutoff: float = 8.0) -> Optional[np.ndarray]:
+    """Boolean (n_a x n_b) array: True where residue i of chain A and residue j
+    of chain B have Cβ–Cβ (Cα for Gly) within ``distance_cutoff``. Rows and
+    columns follow the chains' token order (i-th residue = i-th token), as in
+    the contact counts. None if the structure cannot be read."""
+    sidx = _StructureIndex(struct_path)
+    if not sidx.ok or chain_a not in sidx.coords or chain_b not in sidx.coords:
+        return None
+    xa = sidx.coords[chain_a][:n_a]
+    xb = sidx.coords[chain_b][:n_b]
+    mask = np.zeros((n_a, n_b), dtype=bool)
+    with np.errstate(invalid='ignore'):
+        d = np.sqrt(((xa[:, None, :] - xb[None, :, :]) ** 2).sum(-1))
+        mask[:len(xa), :len(xb)] = d <= distance_cutoff   # NaN (no Cβ/Cα) -> False
+    return mask
+
+
 def _pair_interface_metrics(sidx: _StructureIndex, confidences: Dict, pae_matrix: np.ndarray,
                             chain_a: str, chain_b: str, idx_a: List[int], idx_b: List[int],
                             atom_plddts: Optional[np.ndarray] = None,
